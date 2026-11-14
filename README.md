@@ -16,13 +16,13 @@ Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup>
 
 <br>
 
-<a href="#abstract">Abstract</a> &nbsp;·&nbsp;
-<a href="#method">Method</a> &nbsp;·&nbsp;
-<a href="#results">Results</a> &nbsp;·&nbsp;
-<a href="#quick-check">Quick Check</a> &nbsp;·&nbsp;
-<a href="#reproducing-the-experiments">Reproduce</a> &nbsp;·&nbsp;
-<a href="#related-code-and-papers">Related</a> &nbsp;·&nbsp;
-<a href="#citation">Citation</a>
+<a href="#abstract"><img alt="Abstract" src="https://img.shields.io/badge/Abstract-111111?style=flat-square"></a>
+<a href="#method"><img alt="Method" src="https://img.shields.io/badge/Method-111111?style=flat-square"></a>
+<a href="#results"><img alt="Results" src="https://img.shields.io/badge/Results-111111?style=flat-square"></a>
+<a href="#quick-check"><img alt="Quick Check" src="https://img.shields.io/badge/Quick_Check-111111?style=flat-square"></a>
+<a href="#reproducing-the-experiments"><img alt="Reproduce" src="https://img.shields.io/badge/Reproduce-111111?style=flat-square"></a>
+<a href="#related-code-and-papers"><img alt="Related" src="https://img.shields.io/badge/Related-111111?style=flat-square"></a>
+<a href="#citation"><img alt="Citation" src="https://img.shields.io/badge/Citation-111111?style=flat-square"></a>
 
 <br>
 
