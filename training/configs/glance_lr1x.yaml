@@ -1,0 +1,22 @@
+# Component ablation: glance encoder at the LT-OPD vision-tower learning rate (2e-7).
+data:
+  vqa20k_mixture: lt14k_spatial
+  max_response_length: 256
+actor_rollout_ref:
+  model:
+    vision_token_compressor:
+      curriculum:
+        total_optimizer_steps: 175
+      selector: divprune
+      divprune_seed: centroid
+      efficient_vit: {mode: glance, zoom_ratio: 0.25, min_patches: 4096, feature_distill_coef: 0.0}
+  actor:
+    optim:
+      total_training_steps: 175
+      vision_lr: 2.0e-07
+  rollout:
+    n: 1
+    response_length: 256
+trainer:
+  total_training_steps: 175
+  max_actor_ckpt_to_keep: null

@@ -1,0 +1,28 @@
+# dense_lr10x.yaml with different RNG seeds (seed repeat 1).
+data:
+  vqa20k_mixture: lt14k_spatial
+  max_response_length: 256
+  seed: 20260825
+actor_rollout_ref:
+  model:
+    vision_token_compressor:
+      curriculum:
+        total_optimizer_steps: 175
+      selector: divprune
+      divprune_seed: centroid
+  actor:
+    optim:
+      total_training_steps: 175
+      vision_lr: 2.0e-06
+    data_loader_seed: 43
+    fsdp_config:
+      seed: 43
+  rollout:
+    n: 1
+    response_length: 256
+  ref:
+    fsdp_config:
+      seed: 43
+trainer:
+  total_training_steps: 175
+  max_actor_ckpt_to_keep: null

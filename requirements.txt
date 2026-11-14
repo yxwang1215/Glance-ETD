@@ -1,0 +1,3 @@
+# CPU reference implementation and tests/test_reference.py.
+# Training and inference use the public LT-OPD environment; see README.md.
+torch>=2.6

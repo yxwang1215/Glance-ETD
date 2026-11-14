@@ -1,0 +1,2639 @@
+--- a/evaluation/infer.py
++++ b/evaluation/infer.py
+@@ -61,10 +61,7 @@
+         from mme import runtime_prediction_content, runtime_route_query
+         from runtime import build_route_query, load_export_runtime, prediction_record
+ 
+-    settings = dict(PROTOCOLS[args.dataset])
+-    # LTOPD_MAX_NEW_TOKENS overrides the protocol's answer cap (e.g. to measure truncation); recorded in config.json.
+-    if os.environ.get("LTOPD_MAX_NEW_TOKENS"):
+-        settings["official_max_new_tokens"] = int(os.environ["LTOPD_MAX_NEW_TOKENS"])
++    settings = PROTOCOLS[args.dataset]
+     config = json.loads(args.data_config.read_text(encoding="utf-8"))[args.dataset]
+     config = {k: str((args.data_config.resolve().parent / v).resolve()) for k, v in config.items()}
+     output_dir = args.output_dir / args.dataset / f"rank{args.rank}"
+--- a/learnable_merge/opd_variants.py
++++ b/learnable_merge/opd_variants.py
+@@ -0,0 +1,211 @@
++"""OPD variants for LT-OPD (visual-token-compressed on-policy self-distillation).
++
++Two weighting schemes, both detached and both preserving the vanilla optimum (the student still matches the
++frozen dense teacher; only *where* the distillation budget goes changes):
++
++* SVG-OPD (self-view compression gap). The student is run twice on its own rollout: once on the compressed
++  view it is trained on, once (no grad) on the full dense view. Same weights, different visual input, so the
++  per-token divergence isolates what *this image's token selection* threw away, independent of any
++  teacher/student weight mismatch. Tokens with a large view gap (text strings, counts, spatial words) are
++  up-weighted.
++
++* OC-OPD (outcome-calibrated). Training rows carry gold answers. Sequences where the student's on-policy
++  answer is wrong are boosted; on MCQ rows where the frozen dense teacher itself prefers a wrong option, the
++  sequence is damped so the student is not pulled toward the teacher's error.
++
++All helpers are pure tensor functions so they can be unit-tested on CPU.
++"""
++from __future__ import annotations
++
++import math
++import re
++from typing import Optional, Sequence
++
++import torch
++
++# --------------------------------------------------------------------------------------------- distributions
++_NEG = -1.0e9
++
++
++def add_tail(log_probs: torch.Tensor) -> torch.Tensor:
++    """Append the tail bucket log(1 - sum p) exactly as compute_self_distillation_loss does."""
++    log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True).clamp(max=-1e-7)
++    return torch.cat([log_probs, torch.log(-torch.expm1(log_s))], dim=-1)
++
++
++def support_distribution(topk_log_probs: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
++    """Top-k support log-probs (+tail bucket) as a proper distribution, in float32."""
++    lp = topk_log_probs.detach().float()
++    if valid_mask is not None:
++        lp = lp.masked_fill(~valid_mask.bool(), _NEG)
++    return add_tail(lp)
++
++
++def token_jsd(p_log: torch.Tensor, q_log: torch.Tensor) -> torch.Tensor:
++    """Symmetric Jensen-Shannon divergence over the last axis (log-prob inputs), shape [..., ]."""
++    m_log = torch.logsumexp(torch.stack([p_log, q_log]), dim=0) - math.log(2.0)
++    p = p_log.exp()
++    q = q_log.exp()
++    kl_pm = (p * (p_log - m_log)).sum(-1)
++    kl_qm = (q * (q_log - m_log)).sum(-1)
++    return (0.5 * (kl_pm + kl_qm)).clamp(min=0.0)
++
++
++# --------------------------------------------------------------------------------------------- SVG-OPD
++def svg_token_weights(
++    student_dense_topk: torch.Tensor,
++    student_merge_topk: torch.Tensor,
++    valid_mask: Optional[torch.Tensor],
++    response_mask: torch.Tensor,
++    *,
++    eta: float = 0.5,
++    max_weight: float = 5.0,
++    eps: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-token weights from the student's own dense-vs-compressed view gap.
++
++    w_t = (1 - eta) + eta * clip(g_t / mean_seq(g), 0, max_weight), normalised so every sequence keeps mean 1
++    over its response tokens (the seq-mean-token-mean objective keeps its per-sequence scale).
++    Returns (weights [B, T], gap [B, T]); both detached, zero outside response_mask.
++    """
++    if student_dense_topk.shape != student_merge_topk.shape:
++        raise ValueError("dense and compressed student supports must have the same shape")
++    mask = response_mask.to(torch.float32)
++    gap = token_jsd(
++        support_distribution(student_dense_topk, valid_mask),
++        support_distribution(student_merge_topk, valid_mask),
++    ) * mask
++    count = mask.sum(-1, keepdim=True).clamp(min=1.0)
++    mean_gap = gap.sum(-1, keepdim=True) / count
++    rel = (gap / (mean_gap + eps)).clamp(0.0, max_weight)
++    weights = ((1.0 - eta) + eta * rel) * mask
++    weights = weights / ((weights.sum(-1, keepdim=True) / count).clamp(min=eps))
++    return (weights * mask).detach(), gap.detach()
++
++
++# --------------------------------------------------------------------------------------------- OC-OPD
++VERIFIABLE = {"mcq", "math", "numerical", "regression", "text_vqa", "ocr"}
++_NUM = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
++
++
++def _normalize_text(text: str) -> str:
++    text = text.lower().strip()
++    text = re.sub(r"\s+", " ", text)
++    return text.strip(" .!?;:'\"")
++
++
++def extract_answer(response_text: str) -> str:
++    """Response is prefixed with <answer> by the prompt protocol; keep text before </answer>."""
++    text = response_text.split("</answer>", 1)[0]
++    text = text.replace("<answer>", "")
++    return text.strip()
++
++
++def _to_float(text: str) -> Optional[float]:
++    match = _NUM.search(text.replace(",", ""))
++    if not match:
++        return None
++    try:
++        return float(match.group(0))
++    except ValueError:
++        return None
++
++
++def judge_answer(task_type: str, response_text: str, gold: str) -> int:
++    """1 correct, 0 wrong, -1 not verifiable (open-ended rows or missing gold)."""
++    if task_type not in VERIFIABLE or gold is None or str(gold).strip() == "":
++        return -1
++    pred = extract_answer(response_text)
++    gold = str(gold).strip()
++    if task_type == "mcq":
++        letter = re.match(r"\s*\(?([A-Za-z])\b", pred)
++        return int(bool(letter) and letter.group(1).upper() == gold.upper()[:1])
++    if task_type in {"math", "numerical", "regression"}:
++        g, p = _to_float(gold), _to_float(pred)
++        if g is None:
++            return int(_normalize_text(pred) == _normalize_text(gold))
++        if p is None:
++            return 0
++        tol = 0.01 * abs(g) if task_type == "regression" else 1e-6 * max(1.0, abs(g))
++        return int(abs(p - g) <= tol)
++    return int(_normalize_text(pred) == _normalize_text(gold))
++
++
++def mcq_gold_token_ids(tokenizer, task_type: str, gold: str) -> tuple[int, int]:
++    """Token ids a dense teacher would emit first for the gold MCQ letter ("C" and " C"); -1 if not MCQ."""
++    if task_type != "mcq" or not gold:
++        return (-1, -1)
++    letter = str(gold).strip()[:1].upper()
++    ids = []
++    for text in (letter, " " + letter):
++        enc = tokenizer.encode(text, add_special_tokens=False)
++        ids.append(int(enc[0]) if len(enc) == 1 else -1)
++    return (ids[0], ids[1])
++
++
++def teacher_first_token_wrong(
++    teacher_topk: torch.Tensor,
++    support_indices: torch.Tensor,
++    valid_mask: Optional[torch.Tensor],
++    gold_tokens: torch.Tensor,
++    response_mask: torch.Tensor,
++) -> torch.Tensor:
++    """Bool [B]: MCQ rows where the dense teacher's argmax first response token is not a gold-letter token.
++
++    The union support always contains the teacher's own top-k, so argmax over the support is the teacher argmax.
++    Rows with gold_tokens == -1 (non-MCQ) or an empty first position are never flagged.
++    """
++    first = teacher_topk[:, 0, :].detach().float()
++    if valid_mask is not None:
++        first = first.masked_fill(~valid_mask[:, 0, :].bool(), _NEG)
++    arg = first.argmax(-1, keepdim=True)
++    token = support_indices[:, 0, :].gather(-1, arg).squeeze(-1)
++    gold_tokens = gold_tokens.to(token.device)
++    is_mcq = (gold_tokens >= 0).any(-1) & (response_mask[:, 0] > 0)
++    hit = (token.unsqueeze(-1) == gold_tokens).any(-1)
++    return is_mcq & ~hit
++
++
++def outcome_sequence_weights(
++    student_correct: torch.Tensor,
++    teacher_wrong: torch.Tensor,
++    *,
++    wrong_boost: float = 1.0,
++    teacher_wrong_weight: float = 0.25,
++    eps: float = 1e-6,
++) -> torch.Tensor:
++    """Per-sequence weights [B], mean-normalised to 1 within the micro-batch.
++
++    student wrong (0)            -> 1 + wrong_boost
++    teacher wrong (MCQ)          -> teacher_wrong_weight (overrides the boost)
++    correct / not verifiable     -> 1
++    """
++    w = torch.ones_like(student_correct, dtype=torch.float32)
++    w = torch.where(student_correct == 0, torch.full_like(w, 1.0 + wrong_boost), w)
++    w = torch.where(teacher_wrong.bool(), torch.full_like(w, teacher_wrong_weight), w)
++    return (w / w.mean().clamp(min=eps)).detach()
++
++
++def batch_outcome_tensors(
++    tokenizer,
++    responses: torch.Tensor,
++    response_mask: torch.Tensor,
++    task_types: Sequence[str],
++    answers: Sequence[str],
++) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
++    """Trainer-side: decode rollouts and build (student_correct [B] long, gold_tokens [B,2] long, metrics)."""
++    lengths = response_mask.sum(-1).tolist()
++    correct, gold = [], []
++    for row, (task, ans) in enumerate(zip(task_types, answers)):
++        ids = responses[row, : int(lengths[row])].tolist()
++        text = tokenizer.decode(ids, skip_special_tokens=False)
++        correct.append(judge_answer(str(task), text, ans))
++        gold.append(mcq_gold_token_ids(tokenizer, str(task), ans))
++    student_correct = torch.tensor(correct, dtype=torch.long)
++    gold_tokens = torch.tensor(gold, dtype=torch.long)
++    verifiable = student_correct >= 0
++    metrics = {
++        "outcome/verifiable_frac": verifiable.float().mean().item(),
++        "outcome/student_acc": (student_correct[verifiable] == 1).float().mean().item() if verifiable.any() else float("nan"),
++    }
++    return student_correct, gold_tokens, metrics
+--- a/learnable_merge/selector_methods.py
++++ b/learnable_merge/selector_methods.py
+@@ -0,0 +1,538 @@
++"""actor-side pieces of the query-aware learnable selectors (TED and PGS auxiliary losses).
++
++The compressor (verl/models/transformers/vision_token_compressor.py) records, for every compressed image of
++the student's training forward, the differentiable query-conditioned scores over all N post-merger tokens
++(``compressor.selector_records``).  This module turns them into an auxiliary loss:
++
++* TED (teacher evidence distillation): the frozen dense teacher's answer->image affinity at one middle decoder
++  layer, captured with forward hooks during the teacher pass that OPD already runs, is the soft target.
++* PGS (policy-gradient selection): REINFORCE on the (Gumbel-perturbed) rollout selection with reward
++  -KL_hat(student || teacher) per sequence and an EMA baseline.
++
++CSD needs nothing here (it is an autograd tap inside the compressor) and STE/QSlot train through the OPD loss.
++
++BG-OPD (mode=box) adds:
++
++* box CE: the compressor's box_label_losses on rows that carry OCR / key-region boxes;
++* SVH (SparseMM visual heads, Wang et al. ICCV 2025): on box-labeled rows whose n=1 rollout is correct, each answer
++  token y is aligned to the answer-box tokens I_y, and every full-attention head of the dense teacher scores
++  1[argmax attention row in I_y] / |I_y| (``VisualHeadCapture`` + ``box_selector_loss``).  The top heads' attention
++  from the response to the image tokens is then the selector target on every row, labeled or not.
++"""
++from __future__ import annotations
++
++import json
++import math
++from typing import Any, Optional, Sequence
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++
++def find_compressor(module: nn.Module):
++    """Return the module's query-aware CDPruner compressor, or None."""
++    for sub in module.modules():
++        compressor = sub.__dict__.get("_modules", {}).get("vision_token_compressor")
++        if compressor is not None and getattr(compressor, "query_aware_selector", False):
++            return compressor
++    return None
++
++
++def _contiguous_spans(mask: torch.Tensor) -> list[tuple[int, int]]:
++    spans, start = [], None
++    values = mask.tolist()
++    for index, value in enumerate(values):
++        if value and start is None:
++            start = index
++        elif not value and start is not None:
++            spans.append((start, index))
++            start = None
++    if start is not None:
++        spans.append((start, len(values)))
++    return spans
++
++
++class TeacherEvidenceCapture:
++    """Hooks on the dense teacher: one pre-hook for (input_ids, attention_mask), one on a decoder layer.
++
++    For every image span of every row: e = mean_t softmax_i(cos(a_t - mu, v_i - mu) / tau), where a_t are the
++    hidden states of the valid response (answer) positions, v_i those of the image tokens and mu the mean
++    image hidden state (removes the shared massive-activation direction).  Results are appended in
++    (row, span) order, matching the student's compression order.
++    """
++
++    def __init__(self, teacher: nn.Module, *, response_length: int, layer: int, tau: float, standardize: bool = False):
++        self.response_length = int(response_length)
++        self.tau = float(tau)
++        self.standardize = bool(standardize)
++        self.evidence: list[dict[str, Any]] = []
++        self._pending: Optional[tuple[torch.Tensor, torch.Tensor]] = None
++        self._row_base = 0
++        self._handles = []
++        inner = teacher
++        while hasattr(inner, "_fsdp_wrapped_module"):
++            inner = inner._fsdp_wrapped_module
++        config = getattr(inner, "config", None)
++        self.image_token_id = getattr(config, "image_token_id", None)
++        if self.image_token_id is None:
++            raise RuntimeError("TED needs config.image_token_id on the teacher")
++        layers = None
++        for name, candidate in inner.named_modules():
++            canonical = name.replace("_fsdp_wrapped_module.", "").replace("._fsdp_wrapped_module", "")
++            if isinstance(candidate, nn.ModuleList) and canonical.endswith("language_model.layers"):
++                layers = candidate
++                break
++        if layers is None or len(layers) == 0:
++            raise RuntimeError("TED could not locate the teacher's language_model.layers")
++        index = layer if layer >= 0 else (2 * len(layers)) // 3
++        if not 0 <= index < len(layers):
++            raise ValueError(f"ted_layer {layer} outside [0, {len(layers)})")
++        self.layer_index = index
++        self._handles.append(inner.register_forward_pre_hook(self._pre_hook, with_kwargs=True))
++        self._handles.append(layers[index].register_forward_hook(self._layer_hook))
++
++    def _pre_hook(self, module, args, kwargs):
++        input_ids = kwargs.get("input_ids", args[0] if args else None)
++        attention_mask = kwargs.get("attention_mask")
++        if input_ids is not None:
++            if attention_mask is None:
++                attention_mask = torch.ones_like(input_ids)
++            self._pending = (input_ids.detach(), attention_mask.detach())
++
++    @torch.no_grad()
++    def _layer_hook(self, module, args, output):
++        if self._pending is None:
++            return
++        hidden = output[0] if isinstance(output, (tuple, list)) else output
++        input_ids, attention_mask = self._pending
++        self._pending = None
++        if hidden.ndim != 3 or hidden.shape[:2] != input_ids.shape:
++            raise RuntimeError(f"TED hidden {tuple(hidden.shape)} does not match input_ids {tuple(input_ids.shape)}")
++        seq = input_ids.shape[1]
++        r = min(self.response_length, seq)
++        for row in range(input_ids.shape[0]):
++            valid = attention_mask[row].to(torch.bool)
++            spans = _contiguous_spans(((input_ids[row] == self.image_token_id) & valid).cpu())
++            answer = torch.nonzero(valid[seq - r:], as_tuple=False).flatten() + (seq - r)
++            h = hidden[row].float()
++            for span_index, (start, end) in enumerate(spans):
++                image = h[start:end]
++                mu = image.mean(dim=0, keepdim=True)
++                if answer.numel() == 0:
++                    evidence = torch.full((end - start,), 1.0 / (end - start), device=h.device)
++                else:
++                    keys = F.normalize(image - mu, dim=-1)
++                    queries = F.normalize(h.index_select(0, answer) - mu, dim=-1)
++                    logits = queries @ keys.transpose(0, 1)
++                    if self.standardize:
++                        logits = (logits - logits.mean(dim=-1, keepdim=True)) / logits.std(dim=-1, keepdim=True).clamp_min(1e-6)
++                    evidence = torch.softmax(logits / self.tau, dim=-1).mean(dim=0)
++                self.evidence.append({"row": self._row_base + row, "span": span_index, "evidence": evidence})
++        self._row_base += input_ids.shape[0]
++
++    def close(self):
++        for handle in self._handles:
++            handle.remove()
++        self._handles = []
++
++
++def _ordered_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    counts: dict[int, int] = {}
++    ordered = []
++    for record in records:
++        span = counts.get(record["row"], 0)
++        counts[record["row"]] = span + 1
++        ordered.append({**record, "span": span})
++    return ordered
++
++
++def ted_loss(records, evidence, *, coef: float) -> tuple[Optional[torch.Tensor], dict[str, float]]:
++    """mean over images of KL(e_teacher || softmax(s))."""
++    if not records:
++        return None, {}
++    targets = {(item["row"], item["span"]): item["evidence"] for item in evidence}
++    terms, mismatched, entropy = [], 0, []
++    for record in _ordered_records(records):
++        target = targets.get((record["row"], record["span"]))
++        scores = record["scores"].float()
++        if target is None or target.numel() != scores.numel():
++            mismatched += 1
++            continue
++        target = target.to(scores.device).clamp_min(1e-12)
++        terms.append((target * (target.log() - torch.log_softmax(scores, dim=0))).sum())
++        entropy.append(float(-(target * target.log()).sum() / math.log(max(2, target.numel()))))
++    metrics = {"selector/ted_images": float(len(terms)), "selector/ted_mismatched": float(mismatched)}
++    if not terms:
++        return None, metrics
++    loss = torch.stack(terms).mean()
++    metrics["selector/ted_kl"] = float(loss.detach())
++    metrics["selector/ted_target_norm_entropy"] = sum(entropy) / len(entropy)
++    return coef * loss, metrics
++
++
++def sequence_reverse_kl(log_prob: torch.Tensor, teacher_log_prob: torch.Tensor, response_mask: torch.Tensor):
++    """Per-sequence on-policy estimate of KL(student || teacher) from the sampled tokens."""
++    mask = response_mask.to(torch.float32)
++    per_token = (log_prob.detach().float() - teacher_log_prob.detach().float()) * mask
++    return per_token.sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
++
++
++def pgs_loss(records, sequence_kl: torch.Tensor, stats: dict, *, coef: float, strength: float, ema: float):
++    """REINFORCE: -coef * mean_i A_row(i) * log pi(S_i) / K_i,  A = -(KL - baseline) / std (EMA, clipped)."""
++    if not records:
++        return None, {}
++    reward = -sequence_kl.float()
++    batch_mean = float(reward.mean())
++    batch_var = float(reward.var(unbiased=False)) if reward.numel() > 1 else 0.0
++    if "mean" not in stats:
++        stats["mean"], stats["var"] = batch_mean, max(batch_var, 1e-4)
++    advantage = ((reward - stats["mean"]) / math.sqrt(stats["var"] + 1e-6)).clamp(-3.0, 3.0)
++    stats["mean"] = ema * stats["mean"] + (1.0 - ema) * batch_mean
++    stats["var"] = ema * stats["var"] + (1.0 - ema) * (batch_var + (batch_mean - stats["mean"]) ** 2)
++    terms, score_std = [], []
++    for record in records:
++        scores = record["scores"].float() * float(strength)
++        selected = record["selected"]
++        k = selected.numel()
++        log_prob = (scores.index_select(0, selected).sum() - k * torch.logsumexp(scores, dim=0)) / k
++        terms.append(-advantage[record["row"]].to(log_prob.device) * log_prob)
++        score_std.append(float(record["scores"].detach().float().std()))
++    loss = torch.stack(terms).mean()
++    metrics = {
++        "selector/pgs_adv_abs": float(advantage.abs().mean()),
++        "selector/pgs_reward_mean": batch_mean,
++        "selector/pgs_baseline": stats["mean"],
++        "selector/score_std": sum(score_std) / len(score_std),
++    }
++    return coef * loss, metrics
++
++
++def score_std_metric(records) -> dict[str, float]:
++    if not records:
++        return {}
++    values = [float(record["scores"].detach().float().std()) for record in records]
++    return {"selector/score_std": sum(values) / len(values)}
++
++
++# --------------------------------------------------------------------------------------------- BG-OPD / SVH
++MAX_LABEL_BOXES = 160
++
++
++def parse_box_label(extra_info: Any) -> Optional[dict]:
++    if not isinstance(extra_info, dict):
++        return None
++    raw = extra_info.get("box_label")
++    if raw is None or raw == "":
++        return None
++    label = json.loads(raw) if isinstance(raw, str) else dict(raw)
++    if not label.get("answer_boxes"):
++        return None
++    return label
++
++
++def answer_span_mask(tokenizer, ids: Sequence[int]) -> torch.Tensor:
++    """Bool [len(ids)]: tokens that spell the answer, i.e. non-blank text before '</answer>' (the prompt pre-fills
++    '<answer>')."""
++    ids = list(ids)
++    full = tokenizer.decode(ids, skip_special_tokens=False)
++    end = full.find("</answer>")
++    end = len(full) if end < 0 else end
++    mask = torch.zeros(len(ids), dtype=torch.bool)
++    previous = 0
++    for index in range(len(ids)):
++        current = len(tokenizer.decode(ids[: index + 1], skip_special_tokens=False))
++        if previous >= end:
++            break
++        piece = tokenizer.decode(ids[index : index + 1], skip_special_tokens=False)
++        if piece.strip() and "<answer>" not in piece:
++            mask[index] = True
++        previous = current
++    return mask
++
++
++def batch_box_tensors(
++    tokenizer,
++    responses: torch.Tensor,
++    response_mask: torch.Tensor,
++    task_types: Sequence[str],
++    answers: Sequence[Optional[str]],
++    extra_infos: Sequence[Any],
++) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
++    """Trainer-side BG-OPD labels: boxes [B, M, 4], kinds [B, M] (1 answer, 2 OCR, 0 pad) and the SparseMM
++    alignment mask [B, R] (answer tokens of correct rollouts on labeled rows)."""
++    from opd_variants import judge_answer
++
++    batch, length = responses.shape
++    labels = [parse_box_label(info) for info in extra_infos]
++    rows = []
++    for label in labels:
++        if label is None:
++            rows.append([])
++            continue
++        answer = [(1, box) for box in label["answer_boxes"]]
++        ocr = [(2, box) for box in (label.get("ocr_boxes") or [])]
++        rows.append((answer + ocr)[: max(MAX_LABEL_BOXES, len(answer))])
++    width = max([1] + [len(row) for row in rows])
++    boxes = torch.zeros(batch, width, 4, dtype=torch.float32)
++    kinds = torch.zeros(batch, width, dtype=torch.long)
++    aligned = torch.zeros(batch, length, dtype=torch.bool)
++    lengths = response_mask.sum(-1).tolist()
++    labeled, correct = 0, 0
++    for row, items in enumerate(rows):
++        if not items:
++            continue
++        labeled += 1
++        for slot, (kind, box) in enumerate(items):
++            kinds[row, slot] = kind
++            boxes[row, slot] = torch.tensor([float(x) for x in box])
++        ids = responses[row, : int(lengths[row])].tolist()
++        text = tokenizer.decode(ids, skip_special_tokens=False)
++        if judge_answer(str(task_types[row]), text, answers[row]) == 1:
++            correct += 1
++            aligned[row, : len(ids)] = answer_span_mask(tokenizer, ids)
++    metrics = {
++        "box/labeled_frac": labeled / max(1, batch),
++        "box/labeled_student_acc": correct / labeled if labeled else float("nan"),
++        "box/aligned_tokens": float(aligned.sum()),
++    }
++    return {"box_label_boxes": boxes, "box_label_kinds": kinds, "box_aligned_mask": aligned}, metrics
++
++
++def _unwrap(module: nn.Module) -> nn.Module:
++    while hasattr(module, "_fsdp_wrapped_module"):
++        module = module._fsdp_wrapped_module
++    return module
++
++
++def _language_layers(inner: nn.Module) -> nn.ModuleList:
++    for name, candidate in inner.named_modules():
++        canonical = name.replace("_fsdp_wrapped_module.", "").replace("._fsdp_wrapped_module", "")
++        if isinstance(candidate, nn.ModuleList) and canonical.endswith("language_model.layers"):
++            return candidate
++    raise RuntimeError("could not locate language_model.layers")
++
++
++def full_attention_modules(model: nn.Module) -> list[nn.Module]:
++    """Softmax-attention modules of the decoder, in layer order (Qwen3.5: every 4th layer)."""
++    modules = []
++    for layer in _language_layers(_unwrap(model)):
++        attention = _unwrap(layer).__dict__.get("_modules", {}).get("self_attn")
++        if attention is not None:
++            modules.append(_unwrap(attention))
++    if not modules:
++        raise RuntimeError("no softmax self-attention layers found")
++    return modules
++
++
++def visual_head_count(model: nn.Module) -> int:
++    modules = full_attention_modules(model)
++    heads = int(modules[0].config.num_attention_heads)
++    return len(modules) * heads
++
++
++class VisualHeadCapture:
++    """Per-head teacher attention for SVH, read from the post-RoPE query/key the attention kernel receives.
++
++    While installed, the ``flash_attention_2``/``sdpa``/... entries of ``ALL_ATTENTION_FUNCTIONS`` are wrapped; only
++    calls from the teacher's full-attention modules are inspected, the kernel output is unchanged.  For every row and
++    image span (row order = teacher chunk order, same as TED):
++
++    * ``dist`` [L*H, N]: mean over valid response tokens of each head's attention restricted to the span;
++    * ``hits`` [L*H, T]: for the T aligned response tokens, the argmax of the head's full causal attention row
++      relative to the span start, -1 when the argmax is outside the span (SparseMM's hit test).
++    """
++
++    def __init__(self, teacher: nn.Module, *, response_length: int, aligned_mask: Optional[torch.Tensor]):
++        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
++
++        inner = _unwrap(teacher)
++        config = getattr(inner, "config", None)
++        self.image_token_id = getattr(config, "image_token_id", None)
++        if self.image_token_id is None:
++            raise RuntimeError("SVH needs config.image_token_id on the teacher")
++        self.modules = full_attention_modules(teacher)
++        self.layer_of = {id(module): index for index, module in enumerate(self.modules)}
++        self.heads = int(self.modules[0].config.num_attention_heads)
++        self.response_length = int(response_length)
++        self.aligned = aligned_mask.detach().to(torch.bool).cpu() if aligned_mask is not None else None
++        self.evidence: dict[tuple[int, int], dict[str, Any]] = {}
++        self.calls = 0
++        self._pending: Optional[tuple[torch.Tensor, torch.Tensor, list]] = None
++        self._row_base = 0
++        self._handles = [
++            inner.register_forward_pre_hook(self._pre_hook, with_kwargs=True),
++            inner.register_forward_hook(self._post_hook),
++        ]
++        self._interface = ALL_ATTENTION_FUNCTIONS
++        self._saved: dict[str, tuple[bool, Any]] = {}
++        for key in list(ALL_ATTENTION_FUNCTIONS):
++            original = ALL_ATTENTION_FUNCTIONS[key]
++            self._saved[key] = (key in ALL_ATTENTION_FUNCTIONS._local_mapping, original)
++            ALL_ATTENTION_FUNCTIONS[key] = self._wrap(original)
++
++    def _wrap(self, original):
++        def attention(module, query, key, value, attention_mask, *args, **kwargs):
++            if id(module) in self.layer_of and self._pending is not None:
++                self._capture(module, query, key)
++            return original(module, query, key, value, attention_mask, *args, **kwargs)
++
++        return attention
++
++    def _pre_hook(self, module, args, kwargs):
++        input_ids = kwargs.get("input_ids", args[0] if args else None)
++        attention_mask = kwargs.get("attention_mask")
++        if input_ids is None:
++            return
++        if attention_mask is None:
++            attention_mask = torch.ones_like(input_ids)
++        spans = []
++        for row in range(input_ids.shape[0]):
++            valid = attention_mask[row].to(torch.bool)
++            spans.append(_contiguous_spans(((input_ids[row] == self.image_token_id) & valid).cpu()))
++        self._pending = (input_ids.detach(), attention_mask.detach(), spans)
++
++    def _post_hook(self, module, args, output):
++        if self._pending is not None:
++            self._row_base += self._pending[0].shape[0]
++        self._pending = None
++
++    @torch.no_grad()
++    def _capture(self, module, query, key):
++        input_ids, attention_mask, spans = self._pending
++        batch, heads, seq, _ = query.shape
++        if seq != input_ids.shape[1] or heads != self.heads:
++            raise RuntimeError(f"SVH query {tuple(query.shape)} does not match input_ids {tuple(input_ids.shape)}")
++        self.calls += 1
++        layer = self.layer_of[id(module)]
++        group = heads // key.shape[1]
++        scale = float(getattr(module, "scaling", query.shape[-1] ** -0.5))
++        r = min(self.response_length, seq)
++        positions = torch.arange(seq, device=query.device)
++        for row in range(batch):
++            if not spans[row]:
++                continue
++            valid = attention_mask[row].to(device=query.device, dtype=torch.bool)
++            answer = torch.nonzero(valid[seq - r :], as_tuple=False).flatten() + (seq - r)
++            if answer.numel() == 0:
++                continue
++            q = query[row, :, answer].float()
++            k = key[row].float().repeat_interleave(group, dim=0)
++            logits = (q @ k.transpose(-1, -2)) * scale
++            allowed = valid[None, :] & (positions[None, :] <= answer[:, None])
++            logits = logits.masked_fill(~allowed[None], -torch.inf)
++            gid = self._row_base + row
++            aligned = None
++            if self.aligned is not None and gid < self.aligned.shape[0]:
++                offset = answer - (seq - r)
++                flags = self.aligned[gid].to(query.device)
++                aligned = flags[offset.clamp(max=flags.numel() - 1)] & (offset < flags.numel())
++                if not bool(aligned.any()):
++                    aligned = None
++            argmax = logits[:, aligned].argmax(dim=-1) if aligned is not None else None
++            for span_index, (start, end) in enumerate(spans[row]):
++                entry = self.evidence.setdefault((gid, span_index), {"dist": {}, "hits": {}})
++                entry["dist"][layer] = torch.softmax(logits[:, :, start:end], dim=-1).mean(dim=1)
++                if argmax is not None:
++                    inside = (argmax >= start) & (argmax < end)
++                    entry["hits"][layer] = torch.where(inside, argmax - start, torch.full_like(argmax, -1))
++
++    def finalize(self) -> dict[tuple[int, int], dict[str, Any]]:
++        """Stack layers into [L*H, ...]; spans missing a layer (should not happen) are dropped."""
++        layers = len(self.modules)
++        out = {}
++        for key, entry in self.evidence.items():
++            if len(entry["dist"]) != layers:
++                continue
++            dist = torch.cat([entry["dist"][index] for index in range(layers)], dim=0)
++            hits = None
++            if len(entry["hits"]) == layers:
++                hits = torch.cat([entry["hits"][index] for index in range(layers)], dim=0)
++            out[key] = {"dist": dist, "hits": hits}
++        return out
++
++    def close(self):
++        for handle in self._handles:
++            handle.remove()
++        self._handles = []
++        for key, (was_local, original) in self._saved.items():
++            if was_local:
++                self._interface[key] = original
++            elif key in self._interface._local_mapping:
++                del self._interface._local_mapping[key]
++        self._saved = {}
++
++
++def new_head_stats(num_heads: int) -> dict[str, Any]:
++    return {"local_sum": torch.zeros(num_heads, dtype=torch.float64), "local_tokens": 0.0,
++            "global_sum": torch.zeros(num_heads, dtype=torch.float64), "global_tokens": 0.0, "heads": None}
++
++
++def refresh_visual_heads(stats: dict, *, top: int, min_tokens: int, all_reduce=None) -> dict[str, float]:
++    """Merge the local SparseMM scores across ranks (``all_reduce`` sums a float64 tensor in place) and pick the
++    top heads once ``min_tokens`` aligned answer tokens have been scored."""
++    local = torch.cat([stats["local_sum"], torch.tensor([stats["local_tokens"]], dtype=torch.float64)])
++    if all_reduce is not None:
++        local = all_reduce(local)
++    stats["global_sum"] += local[:-1]
++    stats["global_tokens"] += float(local[-1])
++    stats["local_sum"].zero_()
++    stats["local_tokens"] = 0.0
++    metrics = {"selector/svh_tokens": stats["global_tokens"]}
++    if stats["global_tokens"] >= max(1, min_tokens):
++        score = stats["global_sum"] / stats["global_tokens"]
++        stats["heads"] = torch.topk(score, min(top, score.numel())).indices.sort().values
++        metrics["selector/svh_top_score"] = float(score[stats["heads"]].mean())
++        metrics["selector/svh_mean_score"] = float(score.mean())
++    metrics["selector/svh_ready"] = float(stats["heads"] is not None)
++    return metrics
++
++
++def box_selector_loss(records, evidence, stats: Optional[dict], *, box_coef: float, svh_coef: float):
++    """BG-OPD auxiliary loss: box_coef * mean box CE + svh_coef * mean_i KL(visual-head attention || softmax(s_i)).
++    Also accumulates the SparseMM head scores of this micro-batch into ``stats['local_*']``."""
++    metrics: dict[str, float] = {}
++    terms = []
++    box = [record for record in records if record.get("box_loss") is not None]
++    if box:
++        box_loss = torch.stack([record["box_loss"] for record in box]).mean()
++        metrics["selector/box_ce"] = float(box_loss.detach())
++        metrics["selector/box_images"] = float(len(box))
++        recall = [record["recall"] for record in box if "recall" in record]
++        if recall:
++            metrics["selector/box_recall_at_budget"] = sum(recall) / len(recall)
++        if box_coef > 0:
++            terms.append(box_coef * box_loss)
++    if evidence and stats is not None:
++        hit_tokens, kl_terms, mismatched = 0, [], 0
++        heads = stats.get("heads")
++        for record in _ordered_records(records):
++            entry = evidence.get((record["row"], record["span"]))
++            if entry is None:
++                continue
++            dist = entry["dist"]
++            scores = record["scores"].float()
++            if dist.shape[1] != scores.numel():
++                mismatched += 1
++                continue
++            mask = record.get("answer_mask")
++            hits = entry["hits"]
++            if mask is not None and hits is not None and bool(mask.any()):
++                mask = mask.to(hits.device)
++                inside = (hits >= 0) & mask[hits.clamp_min(0)]
++                stats["local_sum"] += (inside.double().sum(dim=1) / float(mask.sum())).cpu()
++                stats["local_tokens"] += float(hits.shape[1])
++                hit_tokens += hits.shape[1]
++            if heads is not None and svh_coef > 0:
++                target = dist.index_select(0, heads.to(dist.device)).float().mean(dim=0)
++                target = (target / target.sum().clamp_min(1e-12)).to(scores.device).clamp_min(1e-12)
++                kl_terms.append((target * (target.log() - torch.log_softmax(scores, dim=0))).sum())
++        metrics["selector/svh_hit_tokens"] = float(hit_tokens)
++        metrics["selector/svh_mismatched"] = float(mismatched)
++        if kl_terms:
++            kl = torch.stack(kl_terms).mean()
++            metrics["selector/svh_kl"] = float(kl.detach())
++            terms.append(svh_coef * kl)
++    if not terms:
++        return None, metrics
++    return sum(terms), metrics
+--- a/learnable_merge/training/default.yaml
++++ b/learnable_merge/training/default.yaml
+@@ -188,6 +188,11 @@
+       include_environment_feedback: false
+       max_reprompt_len: 25600
+       reprompt_truncation: error
++      opd_variant: vanilla
++      svg_eta: 0.5
++      svg_max_weight: 5.0
++      outcome_wrong_boost: 1.0
++      outcome_teacher_wrong_weight: 0.25
+     checkpoint:
+       async_save: false
+   ref:
+--- a/learnable_merge/training/export.py
++++ b/learnable_merge/training/export.py
+@@ -90,6 +90,9 @@
+     if (compressor.get("global_tokens") or {}).get("enabled") and not any(
+             ".vision_token_compressor.global_tokens." in f".{name}" for name in state):
+         raise ValueError("Compressor enables global_tokens but the checkpoint carries no global-token weights")
++    if (compressor.get("importance") or {}).get("enabled") and not any(
++            ".vision_token_compressor.importance_scorer." in f".{name}" for name in state):
++        raise ValueError("Compressor enables LES importance but the checkpoint carries no scorer weights")
+     with _export_directory(output) as destination:
+         save_file(state, str(destination / "model.safetensors"), metadata={"format": "pt"})
+         config.vision_token_compressor = compressor
+--- a/learnable_merge/training/runtime.py
++++ b/learnable_merge/training/runtime.py
+@@ -16,6 +16,18 @@
+ 
+ def _is_global_tokens_key(name):
+     return ".vision_token_compressor.global_tokens." in f".{name}"
++
++
++IMPORTANCE_SCORER_PREFIX = "model.vision_token_compressor.importance_scorer."
++
++
++def _is_importance_scorer_key(name):
++    return ".vision_token_compressor.importance_scorer." in f".{name}"
++
++
++def _is_aux_compressor_key(name):
++    """Compressor tensors handled outside the learnable-summary contract (DINO tokens, LES scorer)."""
++    return _is_global_tokens_key(name) or _is_importance_scorer_key(name)
+ LEARNABLE_MERGE_INITIALIZATION = "pretrained_mlp_gate_rows_zero_output_v1"
+ LEARNABLE_MERGE_AGGREGATION = "zero_init_signed_residual_v1"
+ LEARNABLE_MERGE_REDUCTION = "differentiable_fp32_zero_init_signed_residual"
+@@ -105,7 +117,7 @@
+     import torch
+ 
+     expected = _expected_learnable_summary_shapes(settings, input_hidden_size=input_hidden_size)
+-    actual = {name for name in state if "vision_token_compressor." in name and not _is_global_tokens_key(name)}
++    actual = {name for name in state if "vision_token_compressor." in name and not _is_aux_compressor_key(name)}
+     if actual != set(expected):
+         raise ValueError(
+             "Compressor checkpoint parameter schema differs: "
+@@ -174,7 +186,7 @@
+ 
+     state = {}
+     for name, path in inventory.items():
+-        if "vision_token_compressor." in name and not _is_global_tokens_key(name):
++        if "vision_token_compressor." in name and not _is_aux_compressor_key(name):
+             with safe_open(str(path), framework="pt", device="cpu") as weights:
+                 state[name] = weights.get_tensor(name)
+     _validate_learnable_summary_state(state, settings, input_hidden_size=input_hidden_size)
+@@ -207,6 +219,29 @@
+     module.load_state_dict({k: v.to(device=device, dtype=dtype) for k, v in state.items()}, strict=True, assign=True)
+ 
+ 
++def _restore_importance_scorer(compressor, inventory):
++    """Strictly load exported LES scorer weights into an attached compressor."""
++    import torch
++    from safetensors import safe_open
++
++    module = getattr(compressor, "importance_scorer", None)
++    names = sorted(name for name in inventory if _is_importance_scorer_key(name))
++    if module is None:
++        if names:
++            raise ValueError("Export has LES scorer weights but its compressor settings disable importance")
++        return
++    if not names:
++        raise ValueError("Compressor settings enable LES importance but the export carries no scorer weights")
++    state = {}
++    for name in names:
++        with safe_open(str(inventory[name]), framework="pt", device="cpu") as weights:
++            state[name.removeprefix(IMPORTANCE_SCORER_PREFIX)] = weights.get_tensor(name)
++    reference = next((p for p in compressor.parameters() if p.device.type != "meta"), None)
++    device = reference.device if reference is not None else torch.device("cpu")
++    module.load_state_dict({k: v.to(device=device, dtype=torch.float32) for k, v in state.items()},
++                           strict=True, assign=True)
++
++
+ def _build_compressor(model_config, settings):
+     from verl.models.transformers.vision_token_compressor import build_vision_token_compressor
+ 
+@@ -405,7 +440,7 @@
+     learned_load_errors = {
+         kind: [name for name in loading_info.get(kind, [])
+                if "vision_token_compressor." in (key := name[0] if isinstance(name, (tuple, list)) else name)
+-               and not _is_global_tokens_key(key)]
++               and not _is_aux_compressor_key(key)]
+         for kind in ("missing_keys", "unexpected_keys", "mismatched_keys")
+     }
+     if any(learned_load_errors.values()):
+@@ -424,6 +459,7 @@
+     _attach_compressor(model, compressor_settings,
+                        compressor=getattr(model.model, "vision_token_compressor", None))
+     _restore_global_tokens(model.model.vision_token_compressor, inventory)
++    _restore_importance_scorer(model.model.vision_token_compressor, inventory)
+     if learned_state:
+         head = model.model.vision_token_compressor.learnable_summary
+         head.load_state_dict({name.removeprefix(LEARNABLE_SUMMARY_PREFIX): value
+--- a/learnable_merge/training/runtime_settings.py
++++ b/learnable_merge/training/runtime_settings.py
+@@ -201,7 +201,7 @@
+ 
+ def validate_batch_layout(config):
+     from verl.trainer.ppo.batch_schedule import TrainingBatchPlan
+-    from verl.utils.dataset.vqa20k_sampler import DATA_MIXTURE, DATA_MIXTURE_15K
++    from verl.utils.dataset.vqa20k_sampler import DATA_MIXTURE, DATA_MIXTURE_14K_SPATIAL, DATA_MIXTURE_15K
+ 
+     if int(config.trainer.nnodes) != 1:
+         raise ValueError('This launcher starts a local Ray cluster; --nodes must be 1.')
+@@ -209,7 +209,7 @@
+     if world_size < 1:
+         raise ValueError('Select at least one visible GPU with --gpus or CUDA_VISIBLE_DEVICES.')
+     mixture = config.data.get('vqa20k_mixture')
+-    contracts = {'lt14k': DATA_MIXTURE, 'lt15k': DATA_MIXTURE_15K}
++    contracts = {'lt14k': DATA_MIXTURE, 'lt15k': DATA_MIXTURE_15K, 'lt14k_spatial': DATA_MIXTURE_14K_SPATIAL}
+     if mixture not in contracts:
+         raise ValueError(f'Unsupported data mixture: {mixture!r}')
+     actor = config.actor_rollout_ref.actor
+--- a/learnable_merge/verl/models/transformers/efficient_vit.py
++++ b/learnable_merge/verl/models/transformers/efficient_vit.py
+@@ -0,0 +1,315 @@
++"""ViT-side acceleration for the LT-OPD student .
++
++At 5% visual-token retention the LLM prefill on HR-4K drops to ~90 ms, while the Qwen3.5 vision tower (24 global
++attention blocks, ~50k patches) still costs 1.7-2.6 s; ~89% of its FLOPs are the N^2 attention term. EC-OPD
++(experiment/encoder_cut) cuts the tower at block L and only runs [L, 24) on selected tokens; the blocks before L stay
++global. This module attacks the remaining terms and is orthogonal to that cut:
++
++  window  (WinRetro) all blocks except ``global_layers`` attend inside non-overlapping windows of
++          ``window_units`` x ``window_units`` merged tokens (Qwen2.5-VL style hybrid), retrofitted by OPD.
++  glance  (Glance-Gaze) pass 1 encodes the image at 1/2 side length (1/4 patches, 1/16 attention); a DivPrune
++          max-min selection on pass-1 tokens picks ``zoom_ratio`` of the coarse cells; pass 2 encodes only the
++          native-resolution patches of those cells. The output is the full native merged grid: zoomed cells carry
++          pass-2 tokens, the rest carry their coarse token copied to the 2x2 native cells, so the downstream selector,
++          budget (5% of the native N) and M-RoPE positions are unchanged. ``zoom_ratio=0`` is the low-resolution
++          control (encode at 1/4 area, upsample tokens). ``pass2_window`` additionally windows pass 2.
++
++Only images with at least ``min_patches`` ViT patches take the efficient path; smaller images (ViT < 40 ms) and
++videos stay dense. Only the student path ("merge" compression) uses it: the dense teacher and full-token evaluation
++call the stock tower. No new parameters, so exports and evaluation loaders are unchanged.
++
++Training aid: with ``feature_distill_coef > 0`` and grad enabled, the stock dense tower (same weights, no grad) gives a
++per-token target and ``1 - cos`` on the merger outputs is recorded for the actor to add to its loss.
++"""
++from __future__ import annotations
++
++import math
++from typing import Any, Mapping, Optional
++
++import torch
++import torch.nn.functional as F
++
++EFFICIENT_VIT_MODES = ("off", "window", "glance")
++_DEFAULTS = {
++    "mode": "off",
++    "min_patches": 4096,
++    "window_units": 8,
++    "global_layers": [5, 11, 17, 23],
++    "zoom_ratio": 0.25,
++    "pass2_window": False,
++    "feature_distill_coef": 0.0,
++}
++
++
++def validate_efficient_vit_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
++    out = dict(_DEFAULTS)
++    if config:
++        unknown = set(config) - set(_DEFAULTS)
++        if unknown:
++            raise ValueError(f"Unknown efficient_vit keys: {sorted(unknown)}")
++        out.update(config)
++    if out["mode"] not in EFFICIENT_VIT_MODES:
++        raise ValueError(f"efficient_vit.mode must be one of {EFFICIENT_VIT_MODES}")
++    out["min_patches"] = int(out["min_patches"])
++    out["window_units"] = int(out["window_units"])
++    out["global_layers"] = sorted(int(i) for i in out["global_layers"])
++    out["zoom_ratio"] = float(out["zoom_ratio"])
++    out["pass2_window"] = bool(out["pass2_window"])
++    out["feature_distill_coef"] = float(out["feature_distill_coef"])
++    if out["window_units"] < 1 or not 0.0 <= out["zoom_ratio"] <= 1.0 or out["feature_distill_coef"] < 0:
++        raise ValueError(f"invalid efficient_vit config {out}")
++    out["enabled"] = out["mode"] != "off"
++    return out
++
++
++# ----------------------------------------------------------------------------------------------------------- helpers
++def _rope(visual, grid: torch.Tensor):
++    rot = visual.rot_pos_emb(grid)
++    rot = rot.reshape(rot.shape[0], -1)
++    emb = torch.cat((rot, rot), dim=-1)
++    return emb.cos(), emb.sin()
++
++
++def _embed(visual, pixel_values: torch.Tensor, grid: torch.Tensor):
++    hidden = visual.patch_embed(pixel_values)
++    hidden = hidden + visual.fast_pos_embed_interpolate(grid)
++    return hidden.reshape(hidden.shape[0], -1), _rope(visual, grid)
++
++
++def _cu(lengths: list[int], device) -> torch.Tensor:
++    return F.pad(torch.tensor(lengths, device=device, dtype=torch.int32).cumsum(0, dtype=torch.int32), (1, 0))
++
++
++def window_permutation(grid_rows: list[tuple[int, int, int]], window_units: int, merge: int = 2):
++    """Patch permutation that makes every window contiguous, plus window lengths (in patches).
++
++    Patches arrive as (t, h/m, w/m, m, m); a merged unit is m*m consecutive patches. Units are stably sorted by
++    (image, frame, window row, window col), so the inverse permutation restores the processor order exactly.
++    """
++    unit = merge * merge
++    perms, lengths, offset = [], [], 0
++    for t, h, w in grid_rows:
++        gh, gw = h // merge, w // merge
++        r = torch.arange(gh).view(gh, 1).expand(gh, gw)
++        c = torch.arange(gw).view(1, gw).expand(gh, gw)
++        nwc = math.ceil(gw / window_units)
++        key = ((r // window_units) * nwc + c // window_units).reshape(-1)
++        per_frame = gh * gw
++        for ti in range(t):
++            order = torch.sort(key, stable=True).indices
++            units = order + ti * per_frame
++            perms.append((units.view(-1, 1) * unit + torch.arange(unit).view(1, -1)).reshape(-1) + offset)
++            lengths.extend((torch.bincount(key) * unit).tolist())
++        offset += t * h * w
++    perm = torch.cat(perms)
++    lengths = [n for n in lengths if n > 0]
++    return perm, lengths
++
++
++def _run_blocks(visual, hidden, pos, cu_full, cu_win=None, global_layers=()):
++    for index, block in enumerate(visual.blocks):
++        cu = cu_full if (cu_win is None or index in global_layers) else cu_win
++        hidden = block(hidden, cu_seqlens=cu, position_embeddings=pos)
++    return hidden
++
++
++def window_forward(visual, pixel_values: torch.Tensor, grid: torch.Tensor, cfg: Mapping[str, Any]) -> torch.Tensor:
++    """Hybrid window/global tower; returns merger outputs in processor order."""
++    rows = [tuple(int(v) for v in row) for row in grid.tolist()]
++    merge = visual.spatial_merge_size
++    hidden, (cos, sin) = _embed(visual, pixel_values, grid)
++    perm, win_lengths = window_permutation(rows, cfg["window_units"], merge)
++    perm = perm.to(hidden.device)
++    hidden, cos, sin = hidden[perm], cos[perm], sin[perm]
++    cu_full = _cu([h * w for t, h, w in rows for _ in range(t)], hidden.device)
++    cu_win = _cu(win_lengths, hidden.device)
++    hidden = _run_blocks(visual, hidden, (cos, sin), cu_full, cu_win, set(cfg["global_layers"]))
++    inverse = torch.empty_like(perm)
++    inverse[perm] = torch.arange(perm.numel(), device=perm.device)
++    return visual.merger(hidden[inverse])
++
++
++def _patches_to_image(patches: torch.Tensor, h: int, w: int, p: int, tp: int, merge: int = 2) -> torch.Tensor:
++    c = patches.shape[1] // (tp * p * p)
++    x = patches.view(h // merge, w // merge, merge, merge, c, tp, p, p)
++    return x.permute(5, 4, 0, 2, 6, 1, 3, 7).reshape(tp, c, h * p, w * p)[0]
++
++
++def _image_to_patches(image: torch.Tensor, p: int, tp: int, merge: int = 2) -> torch.Tensor:
++    c, hh, ww = image.shape
++    h, w = hh // p, ww // p
++    x = image.view(c, h // merge, merge, p, w // merge, merge, p)  # c, gh, i, y, gw, j, x
++    x = x.permute(1, 4, 2, 5, 0, 3, 6)  # gh, gw, i, j, c, y, x
++    x = x.unsqueeze(5).expand(*x.shape[:5], tp, p, p)
++    return x.reshape(h * w, c * tp * p * p)
++
++
++def downsample_patches(patches: torch.Tensor, h: int, w: int, p: int, tp: int, merge: int = 2):
++    """2x area-average downsample in normalized pixel space; pads to a multiple of 2*merge patches first."""
++    image = _patches_to_image(patches.float(), h, w, p, tp, merge)
++    step = 2 * merge
++    h4, w4 = math.ceil(h / step) * step, math.ceil(w / step) * step
++    image = F.pad(image, (0, (w4 - w) * p, 0, (h4 - h) * p))  # 0 == channel mean after normalization
++    low = F.avg_pool2d(image.unsqueeze(0), 2).squeeze(0)
++    return _image_to_patches(low, p, tp, merge).to(patches.dtype), h4 // 2, w4 // 2
++
++
++def _max_min_select(features: torch.Tensor, count: int) -> torch.Tensor:
++    """DivPrune greedy max-min cosine diversity, centroid seed (same rule as the LT-OPD selector)."""
++    from verl.models.transformers.vision_token_compressor import _greedy_max_min_diversity
++
++    normalized = F.normalize(features.float(), dim=-1)
++    return _greedy_max_min_diversity(normalized, output_tokens=int(count), seed="centroid")
++
++
++def glance_forward_one(visual, patches: torch.Tensor, h: int, w: int, cfg: Mapping[str, Any]):
++    """Glance-Gaze for one image (t == 1); returns [h/2 * w/2, out_dim] in processor order and stats."""
++    merge = visual.spatial_merge_size
++    p = visual.patch_embed.patch_size
++    tp = visual.patch_embed.temporal_patch_size
++    device = patches.device
++    gh, gw = h // merge, w // merge
++    low, lh, lw = downsample_patches(patches, h, w, p, tp, merge)
++    low_grid = torch.tensor([[1, lh, lw]], device=device)
++    hidden, pos = _embed(visual, low, low_grid)
++    cu = _cu([lh * lw], device)
++    low_out = visual.merger(_run_blocks(visual, hidden, pos, cu))  # [lh/2 * lw/2, D]
++    lgh, lgw = lh // merge, lw // merge
++    rows = torch.arange(gh, device=device).view(gh, 1).expand(gh, gw)
++    cols = torch.arange(gw, device=device).view(1, gw).expand(gh, gw)
++    coarse_of_native = ((rows // 2) * lgw + cols // 2).reshape(-1)
++    output = low_out.index_select(0, coarse_of_native)
++    stats = {"zoom_cells": 0, "pass1_patches": lh * lw, "pass2_patches": 0}
++    ratio = float(cfg["zoom_ratio"])
++    if ratio <= 0.0:
++        return output, stats
++    # Coarse cells that cover at least one real (unpadded) native cell are candidates.
++    crow = torch.arange(lgh, device=device).view(lgh, 1).expand(lgh, lgw)
++    ccol = torch.arange(lgw, device=device).view(1, lgw).expand(lgh, lgw)
++    valid = ((crow * 2 < gh) & (ccol * 2 < gw)).reshape(-1).nonzero().squeeze(1)
++    count = max(1, min(valid.numel(), round(ratio * valid.numel())))
++    with torch.no_grad():
++        chosen = valid.index_select(0, _max_min_select(low_out.detach().index_select(0, valid), count).to(device))
++    chosen = torch.sort(chosen).values
++    cr, cc = chosen // lgw, chosen % lgw
++    da = torch.tensor([0, 0, 1, 1], device=device)
++    db = torch.tensor([0, 1, 0, 1], device=device)
++    nr, nc = (cr.view(-1, 1) * 2 + da).reshape(-1), (cc.view(-1, 1) * 2 + db).reshape(-1)
++    keep = (nr < gh) & (nc < gw)
++    native_units = torch.sort((nr * gw + nc)[keep]).values
++    unit = merge * merge
++    patch_index = (native_units.view(-1, 1) * unit + torch.arange(unit, device=device).view(1, -1)).reshape(-1)
++    grid = torch.tensor([[1, h, w]], device=device)
++    # Positions come from the full native grid, then the zoomed patches are gathered.
++    pos_embed = visual.fast_pos_embed_interpolate(grid).index_select(0, patch_index)
++    hidden = visual.patch_embed(patches.index_select(0, patch_index)) + pos_embed
++    hidden = hidden.reshape(hidden.shape[0], -1)
++    cos, sin = _rope(visual, grid)
++    cos, sin = cos.index_select(0, patch_index), sin.index_select(0, patch_index)
++    cu_full = _cu([patch_index.numel()], device)
++    cu_win = None
++    if cfg["pass2_window"]:
++        # Windows over native cells; zoomed cells are already sorted by (row, col), so window ids are re-sorted.
++        ws = cfg["window_units"]
++        key = (native_units // gw // ws) * math.ceil(gw / ws) + (native_units % gw) // ws
++        order = torch.sort(key, stable=True).indices
++        perm = (order.view(-1, 1) * unit + torch.arange(unit, device=device).view(1, -1)).reshape(-1)
++        hidden, cos, sin = hidden[perm], cos[perm], sin[perm]
++        cu_win = _cu((torch.bincount(key)[torch.bincount(key) > 0] * unit).tolist(), device)
++    hidden = _run_blocks(visual, hidden, (cos, sin), cu_full, cu_win, set(cfg["global_layers"]))
++    if cu_win is not None:
++        inverse = torch.empty_like(perm)
++        inverse[perm] = torch.arange(perm.numel(), device=device)
++        hidden = hidden[inverse]
++    fine = visual.merger(hidden)
++    output = output.index_copy(0, native_units, fine.to(output.dtype))
++    stats.update(zoom_cells=int(chosen.numel()), pass2_patches=int(patch_index.numel()))
++    return output, stats
++
++
++# ------------------------------------------------------------------------------------------------------- entry point
++class EfficientViTState:
++    """Per-compressor scratch: aux losses recorded during the actor forward and the last call's stats."""
++
++    def __init__(self) -> None:
++        self.records: list[torch.Tensor] = []
++        self.last_stats: dict[str, float] = {}
++        self.calls = 0
++
++
++def efficient_visual_forward(visual, pixel_values: torch.Tensor, grid: torch.Tensor, cfg: Mapping[str, Any],
++                             state: Optional[EfficientViTState] = None) -> torch.Tensor:
++    """Drop-in for ``visual(pixel_values, grid_thw=grid).pooler_output`` on the student path."""
++    rows = [tuple(int(v) for v in row) for row in grid.tolist()]
++    sizes = [t * h * w for t, h, w in rows]
++    merge = visual.spatial_merge_size
++    big = [i for i, (t, h, w) in enumerate(rows) if t * h * w >= cfg["min_patches"] and (cfg["mode"] == "window" or t == 1)]
++    if not big:
++        return visual(pixel_values, grid_thw=grid).pooler_output
++    starts = [0]
++    for n in sizes:
++        starts.append(starts[-1] + n)
++    small = [i for i in range(len(rows)) if i not in big]
++    outputs: list[Optional[torch.Tensor]] = [None] * len(rows)
++    if small:
++        idx = torch.cat([torch.arange(starts[i], starts[i + 1], device=pixel_values.device) for i in small])
++        dense = visual(pixel_values.index_select(0, idx), grid_thw=grid[small]).pooler_output
++        offset = 0
++        for i in small:
++            n = sizes[i] // (merge * merge)
++            outputs[i] = dense[offset: offset + n]
++            offset += n
++    stats = {"evit/images": float(len(big)), "evit/native_patches": float(sum(sizes[i] for i in big)),
++             "evit/encoded_patches": 0.0}
++    if cfg["mode"] == "window":
++        idx = torch.cat([torch.arange(starts[i], starts[i + 1], device=pixel_values.device) for i in big])
++        fast = window_forward(visual, pixel_values.index_select(0, idx), grid[big], cfg)
++        offset = 0
++        for i in big:
++            n = sizes[i] // (merge * merge)
++            outputs[i] = fast[offset: offset + n]
++            offset += n
++        stats["evit/encoded_patches"] = stats["evit/native_patches"]
++    else:
++        for i in big:
++            _, h, w = rows[i]
++            outputs[i], one = glance_forward_one(visual, pixel_values[starts[i]: starts[i + 1]], h, w, cfg)
++            stats["evit/encoded_patches"] += one["pass1_patches"] + one["pass2_patches"]
++    result = torch.cat(outputs, dim=0)
++    if state is not None:
++        state.calls += 1
++        state.last_stats = stats
++        coef = float(cfg["feature_distill_coef"])
++        if coef > 0 and torch.is_grad_enabled() and visual.training:
++            idx = torch.cat([torch.arange(starts[i], starts[i + 1], device=pixel_values.device) for i in big])
++            with torch.no_grad():
++                target = visual(pixel_values.index_select(0, idx), grid_thw=grid[big]).pooler_output
++            student = torch.cat([outputs[i] for i in big], dim=0)
++            loss = (1.0 - F.cosine_similarity(student.float(), target.float(), dim=-1)).mean()
++            state.records.append(loss)
++    return result
++
++
++def pop_aux_loss(module) -> tuple[Optional[torch.Tensor], dict[str, float], Optional[float]]:
++    """Find the efficient-ViT compressor under ``module``; return (mean aux loss, metrics, coef) and clear records."""
++    for sub in module.modules():
++        compressor = sub.__dict__.get("_modules", {}).get("vision_token_compressor")
++        cfg = getattr(compressor, "efficient_vit_config", None) if compressor is not None else None
++        if cfg and cfg.get("enabled"):
++            state = compressor.efficient_vit_state
++            records, state.records = state.records, []
++            metrics = {"evit/feature_cos_loss": 0.0, "evit/aux_images": float(len(records))}
++            if not records:
++                return None, metrics, cfg["feature_distill_coef"]
++            loss = torch.stack(records).mean()
++            metrics["evit/feature_cos_loss"] = float(loss.detach())
++            return loss, metrics, cfg["feature_distill_coef"]
++    return None, {}, None
++
++
++def clear_aux(module) -> None:
++    for sub in module.modules():
++        compressor = sub.__dict__.get("_modules", {}).get("vision_token_compressor")
++        state = getattr(compressor, "efficient_vit_state", None) if compressor is not None else None
++        if state is not None:
++            state.records = []
+--- a/learnable_merge/verl/models/transformers/qwen3_5.py
++++ b/learnable_merge/verl/models/transformers/qwen3_5.py
+@@ -153,7 +153,16 @@
+     inputs_embeds = model.get_input_embeddings()(input_ids)
+     if pixel_values is not None:
+         pixel_values = pixel_values.type(model.visual.dtype)
+-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
++        evit_compressor = getattr(model, "vision_token_compressor", None) if compressor_is_enabled else None
++        evit_config = getattr(evit_compressor, "efficient_vit_config", None)
++        if visual_compression_mode == "merge" and evit_config and evit_config.get("enabled"):
++            from verl.models.transformers.efficient_vit import efficient_visual_forward
++
++            image_embeds = efficient_visual_forward(
++                model.visual, pixel_values, image_grid_thw, evit_config, evit_compressor.efficient_vit_state
++            )
++        else:
++            image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
+         n_image_features = image_embeds.shape[0]
+         if n_image_tokens != n_image_features:
+--- a/learnable_merge/verl/models/transformers/vision_token_compressor.py
++++ b/learnable_merge/verl/models/transformers/vision_token_compressor.py
+@@ -16,6 +16,7 @@
+ from __future__ import annotations
+ 
+ import math
++import os
+ from collections.abc import Mapping
+ from dataclasses import dataclass, replace
+ from numbers import Integral
+@@ -59,6 +60,36 @@
+ # DivPrune's first pick: "nearest_neighbor" is the published rule and costs O(N^2 D);
+ # "centroid" (farthest from the token mean) is O(N D) and keeps the whole selector O(K N D).
+ DIVPRUNE_SEEDS = ("nearest_neighbor", "centroid")
++# adaptive budget (importance.budget_adaptive, BG-OPD box mode only). Set per process by the compressor.
++# K = clamp(round(K0 * (m_lo + (m_hi - m_lo) * t)), 32, max(K0, ceil(kmax * N))), t = sum softmax(rel) * sigmoid(text):
++# the box-supervised scorer's estimate that this question's evidence is text. K0 is the curriculum's fixed budget.
++ADAPTIVE_BUDGET: dict = {"enabled": False, "m_lo": 0.6, "m_hi": 3.0, "kmax": 0.25}
++# Any other process that only (de)serializes routes can opt in from the environment.
++if os.environ.get("LTOPD_ADAPTIVE_BUDGET") == "1":
++    ADAPTIVE_BUDGET["enabled"] = True
++
++
++def adaptive_budget(num_tokens: int, base: int, t: float) -> int:
++    k = round(base * (ADAPTIVE_BUDGET["m_lo"] + (ADAPTIVE_BUDGET["m_hi"] - ADAPTIVE_BUDGET["m_lo"]) * float(t)))
++    cap = max(int(base), math.ceil(ADAPTIVE_BUDGET["kmax"] * num_tokens))
++    return int(min(num_tokens, max(min(32, num_tokens), min(k, cap))))
++
++
++def evidence_tempered_weights(rel: torch.Tensor, txt: torch.Tensor, beta: float, const: bool = False) -> torch.Tensor:
++    """ETD multipliers (N p_i)^(beta t), p = softmax(rel), t = sum p * sigmoid(txt).
++
++    DivPrune's argmax(d * w) is invariant to a common factor, so the log-weights are shifted to max 0 (not clipped):
++    the ordering survives any beta and a uniform map gives equal weights, i.e. plain DivPrune.
++    """
++    logp = torch.log_softmax(rel.float(), 0)
++    # const=True drops the trust factor t, i.e. the constant-exponent rule (N p_i)^beta of the paper.
++    t = 1.0 if const else (logp.exp() * torch.sigmoid(txt.float())).sum()
++    logw = beta * t * (logp + math.log(rel.numel()))
++    return torch.exp((logw - logw.max()).clamp_min(-80.0))
++
++
++def _budget_ok(tokens: int, expected: int, original: int) -> bool:
++    return int(tokens) == int(expected) or (ADAPTIVE_BUDGET["enabled"] and 1 <= int(tokens) <= int(original))
+ LEGACY_CONDITIONAL_DIVERSITY_ALGORITHM = "qwen35_conditional_diversity_prune_v1"
+ HOLITOM_DPC_SPATIAL_MERGE_ALGORITHM = "qwen35_holitom_dpc_spatial_merge_v1"
+ HOLITOM_DPC_SPATIAL_MERGE_METHOD = "holitom_inspired_dpc_diversity_merge"
+@@ -145,6 +176,9 @@
+     # signed residual weights; retained-anchor priors are exactly zero.
+     merge_assignment: Optional[torch.Tensor] = None
+     merge_prior_weights: Optional[torch.Tensor] = None
++    # query-aware selectors: the user-question token ids seen when the route was built, so the
++    # training-time replay can recompute the (differentiable) query-conditioned scores. None otherwise.
++    query_token_ids: Optional[torch.Tensor] = None
+ 
+     @property
+     def summary_enabled(self) -> bool:
+@@ -289,7 +323,7 @@
+             expected_tokens = _exact_cdpruner_budget(
+                 self.original_tokens, retention_bps=int(self.retention_bps) if self.retention_bps is not None else 500,
+             )
+-            if self.output_tokens != expected_tokens:
++            if not _budget_ok(self.output_tokens, expected_tokens, self.original_tokens):
+                 raise ValueError("Learnable merge output count must equal the original CDPruner K without an extra token")
+ 
+     def to(self, device: torch.device | str) -> "DARTMergeRoute":
+@@ -311,6 +345,7 @@
+             summary_weights=(self.summary_weights.to(device=device) if self.summary_weights is not None else None),
+             merge_assignment=(self.merge_assignment.to(device=device) if self.merge_assignment is not None else None),
+             merge_prior_weights=(self.merge_prior_weights.to(device=device) if self.merge_prior_weights is not None else None),
++            query_token_ids=(self.query_token_ids.to(device=device) if self.query_token_ids is not None else None),
+         )
+ 
+     def as_dict(self, *, cpu: bool = True) -> dict:
+@@ -357,6 +392,8 @@
+                 "merge_prior_weight_format": CDPRUNER_SUMMARY_WEIGHT_FORMAT,
+                 "merge_prior_weight_bits": route.merge_prior_weights.detach().contiguous().view(torch.int32),
+             })
++        if route.query_token_ids is not None:
++            payload["query_token_ids"] = route.query_token_ids
+         return payload
+ 
+     @classmethod
+@@ -434,6 +471,7 @@
+             summary_weights=exact_weight_tensor(),
+             merge_assignment=(exact_long_tensor("merge_assignment") if payload.get("merge_assignment") is not None else None),
+             merge_prior_weights=exact_weight_tensor(merge=True),
++            query_token_ids=(exact_long_tensor("query_token_ids") if payload.get("query_token_ids") is not None else None),
+         )
+         if device is not None:
+             route = route.to(device)
+@@ -840,7 +878,7 @@
+         minimum_tokens=int(minimum_tokens),
+     )
+     expected_budget += int(summary_enabled and expected_budget < route.original_tokens)
+-    if route.output_tokens != expected_budget:
++    if not _budget_ok(route.output_tokens, expected_budget, route.original_tokens):
+         raise ValueError(
+             "curriculum CDPruner route budget drift: "
+             f"N={route.original_tokens}, K={route.output_tokens}, expected={expected_budget}, "
+@@ -1235,9 +1273,17 @@
+     output_tokens: int,
+     seed: str = "nearest_neighbor",
+     chunk_tokens: int = 2048,
++    importance: Optional[torch.Tensor] = None,
++    forced: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+     """DivPrune (Alvar et al., CVPR 2025) greedy max-min diversity on cosine distance.
+ 
++    ``forced`` (BG-OPD): token indices that are selected first (the learned box-relevance top-k); the
++    remaining budget is filled by max-min diversity from that set.
++
++    ``importance`` (LES): optional positive per-token multipliers; each greedy step picks
++    argmax(min_distance * importance). All-ones importance reproduces DivPrune exactly.
++
+     The first token is the one farthest from its nearest neighbour (``seed="nearest_neighbor"``)
+     or from the token mean (``seed="centroid"``); each next token maximizes its minimum distance
+     to the selected set. Distances are produced row by row, so no ``N x N`` matrix is kept.
+@@ -1249,6 +1295,18 @@
+         raise ValueError(f"output_tokens must be in [1, {num_tokens}], got {output_tokens}")
+     if seed not in DIVPRUNE_SEEDS:
+         raise ValueError(f"Unknown DivPrune seed {seed!r}; expected one of {DIVPRUNE_SEEDS}")
++    if forced is not None and forced.numel() > 0:
++        visual = normalized_visual.to(torch.float32)
++        forced = torch.unique(forced.to(device=visual.device, dtype=torch.long))[:output_tokens]
++        chosen = [int(x) for x in forced.tolist()]
++        min_distance = 1.0 - (visual @ visual[forced].transpose(0, 1)).max(dim=1).values
++        min_distance[forced] = -torch.inf
++        while len(chosen) < output_tokens:
++            pivot = int(torch.argmax(min_distance))
++            chosen.append(pivot)
++            min_distance = torch.minimum(min_distance, 1.0 - torch.mv(visual, visual[pivot]))
++            min_distance[pivot] = -torch.inf
++        return torch.sort(torch.tensor(chosen, device=visual.device, dtype=torch.long)).values
+     visual = normalized_visual.to(torch.float32)
+     selected = torch.empty(output_tokens, device=visual.device, dtype=torch.long)
+     if seed == "centroid":
+@@ -1264,8 +1322,19 @@
+         selected[0] = torch.argmin(nearest)
+     min_distance = 1.0 - torch.mv(visual, visual[selected[0]])
+     min_distance[selected[0]] = -torch.inf
++    if importance is not None:
++        importance = importance.detach().to(device=visual.device, dtype=torch.float32).reshape(-1)
++        if importance.numel() != num_tokens or not bool((importance > 0).all().item()):
++            raise ValueError("DivPrune importance must hold one positive multiplier per token")
+     for step in range(1, output_tokens):
+-        pivot = torch.argmax(min_distance)
++        if importance is None:
++            pivot = torch.argmax(min_distance)
++        else:
++            # Unselected tokens have cosine distance >= 0 (clamped for fp noise); selected ones stay -inf.
++            weighted = torch.where(
++                torch.isinf(min_distance), min_distance, min_distance.clamp(min=0.0) * importance
++            )
++            pivot = torch.argmax(weighted)
+         selected[step] = pivot
+         min_distance = torch.minimum(min_distance, 1.0 - torch.mv(visual, visual[pivot]))
+         min_distance[selected[: step + 1]] = -torch.inf
+@@ -1751,6 +1820,9 @@
+     learnable_merge: Optional[Mapping[str, Any]] = None,
+     selector: str = "cdpruner",
+     divprune_seed: str = "nearest_neighbor",
++    importance: Optional[torch.Tensor] = None,
++    forced_indices: Optional[torch.Tensor] = None,
++    output_tokens_override: Optional[int] = None,
+ ) -> DARTMergeRoute:
+     """Build the exact-budget Qwen CDPruner pure-index route.
+ 
+@@ -1798,7 +1870,12 @@
+         curriculum_enabled=curriculum_enabled,
+         learnable_merge_enabled=merge_enabled,
+     )
+-    output_tokens = _exact_cdpruner_budget(num_tokens, retention_bps=retention_bps)
++    output_tokens = (
++        int(output_tokens_override) if output_tokens_override is not None
++        else _exact_cdpruner_budget(num_tokens, retention_bps=retention_bps)
++    )
++    if not 1 <= output_tokens <= num_tokens:
++        raise ValueError(f"output_tokens_override {output_tokens} outside [1, {num_tokens}]")
+     coordinates = image_coordinates.detach().to(device=image_embeds.device, dtype=torch.long)
+     if output_tokens == num_tokens:
+         selected_indices = torch.arange(num_tokens, device=image_embeds.device, dtype=torch.long)
+@@ -1830,9 +1907,12 @@
+     )
+     if selector == "divprune":
+         selected_indices = _greedy_max_min_diversity(
+-            normalized_visual, output_tokens=output_tokens, seed=divprune_seed,
++            normalized_visual, output_tokens=output_tokens, seed=divprune_seed, importance=importance,
++            forced=forced_indices,
+         )
+     elif selector == "cdpruner":
++        if importance is not None:
++            raise ValueError("LES importance is only defined for the DivPrune selector")
+         selected_indices = _fast_greedy_conditional_dpp(
+             normalized_visual,
+             quality,
+@@ -2244,8 +2324,53 @@
+         selector: str = "cdpruner",
+         divprune_seed: str = "nearest_neighbor",
+         global_tokens: Optional[Mapping[str, Any]] = None,
++        importance: Optional[Mapping[str, Any]] = None,
++        efficient_vit: Optional[Mapping[str, Any]] = None,
+     ) -> None:
+         super().__init__()
++        # ViT-side acceleration on the student path (window / glance); no parameters.
++        from verl.models.transformers.efficient_vit import EfficientViTState, validate_efficient_vit_config
++
++        self.efficient_vit_config = validate_efficient_vit_config(efficient_vit)
++        self.efficient_vit_state = EfficientViTState()
++        self.importance_config = validate_importance_config(importance)
++        self.budget_records: list = []
++        if self.importance_config["budget_adaptive"]:
++            if self.importance_config["mode"] != "box":
++                raise ValueError("importance.budget_adaptive needs mode=box (the box-supervised scorer)")
++            ADAPTIVE_BUDGET.update(enabled=True, m_lo=self.importance_config["budget_m_lo"],
++                                   m_hi=self.importance_config["budget_m_hi"], kmax=self.importance_config["budget_kmax"])
++        self.importance_scorer = None
++        if self.importance_config["enabled"]:
++            if selector != "divprune":
++                raise ValueError("LES importance requires selector=divprune")
++            if input_hidden_size is None:
++                raise ValueError("LES importance requires the language-model input_hidden_size")
++            if self.importance_config["selector_arch"] == "qsel":
++                self.importance_scorer = QSelScorer(
++                    int(input_hidden_size), hidden_size=self.importance_config["hidden_size"],
++                    init_checkpoint=self.importance_config["init_checkpoint"],
++                )
++            elif self.importance_config["query_aware"]:
++                self.importance_scorer = QueryAwareScorer(
++                    int(input_hidden_size), hidden_size=self.importance_config["hidden_size"],
++                    num_slots=self.importance_config["num_slots"],
++                )
++            else:
++                self.importance_scorer = TokenImportanceScorer(
++                    int(input_hidden_size), hidden_size=self.importance_config["hidden_size"]
++                )
++        # Training-only side channels (never part of the state dict):
++        #   selector_exploration  PGS Gumbel noise at rollout; on during training steps, off for evaluation
++        #   selector_records      differentiable per-image scores for the actor's TED/PGS auxiliary losses
++        #   selector_current_row  batch row of the span being compressed (set by compress_image_embeds)
++        #   selector_grad_scale   micro-batch loss scale applied to the CSD tap gradient
++        self.selector_exploration = False
++        self.selector_records: list[dict[str, Any]] = []
++        self.selector_current_row = 0
++        self.selector_grad_scale = 1.0
++        #   selector_box_labels   (boxes [B, M, 4], kinds [B, M]) of the current micro-batch (BG-OPD), set by the actor
++        self.selector_box_labels = None
+         if selector not in CDPRUNER_SELECTORS:
+             raise ValueError(f"Unknown CDPruner selector {selector!r}; expected one of {CDPRUNER_SELECTORS}")
+         if divprune_seed not in DIVPRUNE_SEEDS:
+@@ -2343,12 +2468,32 @@
+         self.curriculum_completed_steps = int(state["completed_optimizer_steps"])
+         self.active_retention_bps = int(state["retention_bps"])
+         self.retention_ratio = self.active_retention_bps / 10_000.0
++        self.selector_exploration = True  # training steps bind the curriculum; evaluation turns it off
+         return state
+ 
++    @property
++    def selector_mode(self) -> Optional[str]:
++        return self.importance_config["mode"] if self.importance_scorer is not None else None
++
++    @property
++    def query_aware_selector(self) -> bool:
++        return self.importance_scorer is not None and self.importance_config["query_aware"]
++
++    def extra_tokens_per_image(self) -> int:
++        """Tokens prepended to every compressed image span (DINO global tokens + QSlot soft patches)."""
++        dino = int(getattr(self.global_tokens, "num_tokens", 0) or 0) if self.global_tokens is not None else 0
++        return dino + (self.importance_config["num_slots"] if self.importance_scorer is not None else 0)
++
++    def _selector_scores(self, embeds: torch.Tensor, query_embeds: Optional[torch.Tensor]) -> torch.Tensor:
++        if self.importance_config["query_aware"]:
++            return self.importance_scorer(embeds, query_embeds)
++        return self.importance_scorer(embeds)
++
+     def set_final_retention_for_evaluation(self) -> dict[str, Any]:
+         """Use the final 5% budget for inference."""
+ 
+         if self.curriculum is None:
++            self.selector_exploration = False
+             return {
+                 "schema_version": None,
+                 "schedule_sha256": None,
+@@ -2356,7 +2501,9 @@
+                 "retention_bps": 500,
+                 "minimum_tokens_per_image": self.minimum_tokens,
+             }
+-        return self.set_curriculum_step(self.curriculum.total_optimizer_steps - 1)
++        state = self.set_curriculum_step(self.curriculum.total_optimizer_steps - 1)
++        self.selector_exploration = False  # PGS noise is a training-rollout device only
++        return state
+ 
+     def _active_budget_state(self) -> tuple[int, Optional[int], Optional[str]]:
+         if self.curriculum is not None and (
+@@ -2381,11 +2528,46 @@
+         *,
+         query_embeds: Optional[torch.Tensor] = None,
+         image_coordinates: Optional[torch.Tensor] = None,
++        query_token_ids: Optional[torch.Tensor] = None,
+     ) -> tuple[torch.Tensor, DARTMergeRoute]:
+         retention_bps, curriculum_completed_steps, schedule_sha256 = self._active_budget_state()
++        mode = self.selector_mode
+         if route is None:
+             if query_embeds is None or image_coordinates is None:
+                 raise ValueError("New CDPruner routes require query embeddings and image coordinates")
++            importance = None
++            forced_indices = None
++            budget_override = None
++            if mode == "box":
++                with torch.no_grad():
++                    rel, txt = self.importance_scorer(image_embeds, query_embeds, image_coordinates)
++                    budget = _exact_cdpruner_budget(image_embeds.shape[0], retention_bps=retention_bps)
++                    if ADAPTIVE_BUDGET["enabled"]:
++                        t = float((torch.softmax(rel.float(), 0) * torch.sigmoid(txt.float())).sum())
++                        budget = adaptive_budget(int(image_embeds.shape[0]), budget, t)
++                        budget_override = budget
++                        self.budget_records.append({"n": int(image_embeds.shape[0]), "k": budget, "t": t})
++                    beta = self.importance_config["tilt_beta"]
++                    if beta > 0.0:
++                        # ETD: DivPrune's argmax(d_i) becomes argmax(d_i * (N p_i)^(beta t)); t is the scorer's
++                        # own estimate that the evidence is text, so an untrusted or flat map leaves DivPrune unchanged.
++                        importance = evidence_tempered_weights(rel, txt, beta, self.importance_config.get("tilt_const", False))
++                    else:
++                        k_forced = min(budget, max(1, math.ceil(self.importance_config["split_ratio"] * budget)))
++                        if budget < image_embeds.shape[0]:
++                            forced_indices = torch.topk(rel, k_forced).indices
++            elif self.importance_scorer is not None and mode != "qslot":
++                with torch.no_grad():
++                    raw_scores = self._selector_scores(image_embeds, query_embeds)
++                    noise = None
++                    tau = self.importance_config["explore_tau"]
++                    if mode == "pgs" and self.selector_exploration and tau > 0.0:
++                        uniform = torch.rand(raw_scores.shape, device=raw_scores.device).clamp(1e-6, 1.0 - 1e-6)
++                        noise = -torch.log(-torch.log(uniform)) * tau
++                    importance = TokenImportanceScorer.multipliers(
++                        raw_scores, strength=self.importance_config["lambda"], clip=self.importance_config["clip"],
++                        noise=noise,
++                    )
+             route = build_cdpruner_route(
+                 image_embeds,
+                 query_embeds=query_embeds,
+@@ -2400,7 +2582,15 @@
+                 learnable_merge=self.learnable_merge_config,
+                 selector=self.selector,
+                 divprune_seed=self.divprune_seed,
+-            )
++                importance=importance,
++                forced_indices=forced_indices,
++                output_tokens_override=budget_override,
++            )
++            if self.query_aware_selector:
++                if query_token_ids is None:
++                    raise ValueError("Query-aware selectors must record the question token ids in the route")
++                route = replace(route, query_token_ids=query_token_ids.detach().to(device=route.selected_indices.device,
++                                                                                    dtype=torch.long))
+         else:
+             route = route.to(image_embeds.device)
+             route.validate_for_algorithm(
+@@ -2419,7 +2609,7 @@
+                     route.original_tokens, retention_bps=retention_bps
+                 )
+                 expected += int(self.summary_enabled and expected < route.original_tokens)
+-                if route.output_tokens != expected:
++                if not _budget_ok(route.output_tokens, expected, route.original_tokens):
+                     raise ValueError(
+                         f"Replayed CDPruner route has {route.output_tokens} tokens; "
+                         f"expected exact budget {expected}"
+@@ -2438,9 +2628,408 @@
+             )
+         else:
+             reduced = prune_image_embeds(image_embeds, route)
++        if mode == "box" and torch.is_grad_enabled():
++            if query_embeds is None or image_coordinates is None:
++                raise ValueError("BG-OPD replay needs the question embeddings and image coordinates")
++            row = int(self.selector_current_row)
++            rel, txt = self.importance_scorer(image_embeds, query_embeds, image_coordinates)
++            record = {"row": row, "scores": rel, "box_loss": None, "answer_mask": None}
++            if self.selector_box_labels is not None:
++                boxes, kinds = self.selector_box_labels
++                row_kinds = kinds[row].to(image_embeds.device)
++                if bool((row_kinds > 0).any()):
++                    loss, info = box_label_losses(
++                        rel, txt, image_coordinates, boxes[row].to(image_embeds.device), row_kinds,
++                        text_coef=self.importance_config["text_coef"],
++                    )
++                    record.update(info)
++                    record["box_loss"] = loss
++            self.selector_records.append(record)
++        if self.importance_scorer is not None and torch.is_grad_enabled() and mode in ("csd", "ted", "pgs"):
++            if query_embeds is None:
++                raise ValueError(f"Selector mode {mode} needs the question embeddings during replay")
++            scores = self._selector_scores(image_embeds, query_embeds)
++            selected = route.selected_indices.to(image_embeds.device)
++            if mode == "csd":
++                if route.merge_assignment is None:
++                    raise ValueError("CSD needs the learnable-merge slot assignment")
++                reduced = _SwapGainTap.apply(
++                    reduced, scores, image_embeds.detach(), selected,
++                    route.merge_assignment.to(image_embeds.device),
++                    self.importance_config["coef"] * float(self.selector_grad_scale),
++                    self.importance_config["temperature"], 4096,
++                )
++            else:
++                self.selector_records.append({
++                    "row": int(self.selector_current_row), "scores": scores, "selected": selected,
++                })
++        if self.importance_scorer is not None and torch.is_grad_enabled() and mode == "ste":
++            # LES straight-through gate: forward value is exactly unchanged (g / sg(g) == 1); the backward pass
++            # gives each retained slot's anchor score d(OPD loss)/d(scale of that slot) * (1 - g).
++            if self.summary_enabled or reduced.shape[0] != route.selected_indices.numel():
++                raise RuntimeError("LES gate expects one reduced slot per selected anchor")
++            anchor_scores = self._selector_scores(
++                image_embeds.index_select(0, route.selected_indices.to(image_embeds.device)), query_embeds
++            )
++            gate = torch.sigmoid(anchor_scores)
++            factor = gate / gate.detach()
++            reduced = reduced * factor.unsqueeze(-1).to(reduced.dtype)
+         return reduced, route
+ 
+ 
++IMPORTANCE_MODES = ("ste", "csd", "ted", "pgs", "qslot", "box")
++
++
++def validate_importance_config(config: Optional[Mapping[str, Any]]) -> dict[str, Any]:
++    """Learnable selector settings; disabled unless ``enabled: true``.
++
++    mode (query-aware selectors; ``ste`` without ``query_aware`` is LES):
++      ste   straight-through gate on retained slots (first-order "scale this slot" attribution)
++      csd   counterfactual swap distillation: every discarded token's first-order loss change if it replaced
++            its slot anchor, distilled into the scorer with a per-slot ListNet loss (autograd tap)
++      ted   teacher evidence distillation: the frozen dense teacher's answer->image affinity map is the target
++      pgs   policy-gradient selection: Gumbel-perturbed selection at rollout, REINFORCE with -KL(student||teacher)
++      qslot query-conditioned learnable soft patches appended to every image span (selection stays DivPrune)
++    """
++    config = dict(config or {})
++    allowed = {"enabled", "lambda", "hidden_size", "clip", "mode", "query_aware", "coef", "temperature",
++               "explore_tau", "num_slots", "ted_layer", "ted_tau", "pgs_ema", "ted_standardize",
++               "selector_arch", "init_checkpoint", "split_ratio", "text_coef", "box_coef", "svh_coef", "svh_heads",
++               "svh_min_tokens", "budget_adaptive", "budget_m_lo", "budget_m_hi", "budget_kmax", "tilt_beta", "tilt_const"}
++    unknown = set(config) - allowed
++    if unknown:
++        raise ValueError(f"Unknown importance settings: {sorted(unknown)}")
++    out = {
++        "enabled": bool(config.get("enabled", False)),
++        "lambda": float(config.get("lambda", 1.0)),
++        "hidden_size": int(config.get("hidden_size", 64)),
++        "clip": float(config.get("clip", 3.0)),
++        "mode": str(config.get("mode", "ste")),
++        "query_aware": bool(config.get("query_aware", False)),
++        "coef": float(config.get("coef", 1.0)),
++        "temperature": float(config.get("temperature", 1.0)),
++        "explore_tau": float(config.get("explore_tau", 0.0)),
++        "num_slots": int(config.get("num_slots", 0)),
++        "ted_layer": int(config.get("ted_layer", -1)),
++        "ted_tau": float(config.get("ted_tau", 0.1)),
++        "pgs_ema": float(config.get("pgs_ema", 0.95)),
++        # z-score each answer token's image affinities before the temperature (v8 targets were ~uniform).
++        "ted_standardize": bool(config.get("ted_standardize", False)),
++        # BG-OPD (mode=box): box-label-supervised QuerySelector (evidence-scorer architecture).
++        "selector_arch": str(config.get("selector_arch", "mlp")),
++        "init_checkpoint": config.get("init_checkpoint"),
++        "split_ratio": float(config.get("split_ratio", 0.5)),
++        "text_coef": float(config.get("text_coef", 0.2)),
++        "box_coef": float(config.get("box_coef", 1.0)),
++        # SparseMM-style visual heads of the dense teacher: scored on box-labeled rows the student answered
++        # correctly, then their answer->image attention is the selector target on every row.
++        "svh_coef": float(config.get("svh_coef", 0.0)),
++        "svh_heads": int(config.get("svh_heads", 6)),
++        "svh_min_tokens": int(config.get("svh_min_tokens", 200)),
++        # adaptive per-image budget (box mode only).
++        "budget_adaptive": bool(config.get("budget_adaptive", False)),
++        "budget_m_lo": float(config.get("budget_m_lo", 0.6)),
++        "budget_m_hi": float(config.get("budget_m_hi", 3.0)),
++        "budget_kmax": float(config.get("budget_kmax", 0.25)),
++        # ETD (box mode): > 0 replaces the forced top split with DivPrune multipliers (N p)^(beta t).
++        "tilt_beta": float(config.get("tilt_beta", 0.0)),
++        "tilt_const": bool(config.get("tilt_const", False)),  # exponent beta instead of beta * t
++    }
++    if out["lambda"] < 0.0 or out["clip"] <= 0.0 or out["hidden_size"] <= 0:
++        raise ValueError("importance.lambda must be >= 0, clip > 0, hidden_size > 0")
++    if out["mode"] not in IMPORTANCE_MODES:
++        raise ValueError(f"importance.mode must be one of {IMPORTANCE_MODES}")
++    if out["mode"] != "ste" and not out["query_aware"]:
++        raise ValueError(f"importance.mode={out['mode']} requires query_aware=true")
++    if (out["mode"] == "qslot") != (out["num_slots"] > 0):
++        raise ValueError("importance.num_slots > 0 exactly when mode=qslot")
++    if out["coef"] < 0.0 or out["temperature"] <= 0.0 or out["explore_tau"] < 0.0 or out["ted_tau"] <= 0.0:
++        raise ValueError("importance.coef/explore_tau must be >= 0 and temperature/ted_tau > 0")
++    if out["selector_arch"] not in ("mlp", "qsel"):
++        raise ValueError("importance.selector_arch must be mlp or qsel")
++    if (out["mode"] == "box") != (out["selector_arch"] == "qsel"):
++        raise ValueError("importance.selector_arch=qsel exactly when mode=box")
++    if not 0.0 < out["split_ratio"] <= 1.0 or min(out["text_coef"], out["box_coef"], out["svh_coef"]) < 0.0:
++        raise ValueError("importance.split_ratio in (0, 1], text_coef/box_coef/svh_coef >= 0")
++    if out["tilt_beta"] < 0.0 or (out["tilt_beta"] > 0.0 and out["mode"] != "box"):
++        raise ValueError("importance.tilt_beta must be >= 0 and needs mode=box")
++    if out["svh_heads"] <= 0 or out["svh_min_tokens"] < 0:
++        raise ValueError("importance.svh_heads > 0 and svh_min_tokens >= 0")
++    if not 0.0 <= out["pgs_ema"] < 1.0:
++        raise ValueError("importance.pgs_ema must be in [0, 1)")
++    return out
++
++
++class TokenImportanceScorer(nn.Module):
++    """LES scorer: post-merger visual embedding -> scalar evidence score.
++
++    The output layer is zero-initialised, so every token scores 0 at step 0 and selection is exactly DivPrune.
++    Inputs are detached: the scorer never sends gradients into the vision tower.
++    """
++
++    def __init__(self, input_hidden_size: int, hidden_size: int = 64) -> None:
++        super().__init__()
++        self.input = nn.Linear(int(input_hidden_size), int(hidden_size))
++        self.output = nn.Linear(int(hidden_size), 1)
++        self.reset_parameters()
++
++    def reset_parameters(self) -> None:
++        nn.init.normal_(self.input.weight, std=0.02)
++        nn.init.zeros_(self.input.bias)
++        nn.init.zeros_(self.output.weight)
++        nn.init.zeros_(self.output.bias)
++
++    def forward(self, embeds: torch.Tensor) -> torch.Tensor:
++        weight = self.input.weight
++        x = embeds.detach().to(weight.dtype)
++        x = torch.nn.functional.layer_norm(x, (x.shape[-1],))
++        return self.output(torch.nn.functional.gelu(self.input(x))).squeeze(-1).float()
++
++    @staticmethod
++    def multipliers(
++        scores: torch.Tensor, *, strength: float, clip: float, noise: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        """exp(lambda * clip(s - mean(s))): centred but NOT standardised, so the learned score scale is the
++        selector's confidence. Scores start at exactly 0 (zero-init head) -> all-ones -> plain DivPrune, and the
++        selection departs from DivPrune only as fast as the scorer actually learns."""
++        scores = scores.detach().float()
++        if not bool(torch.isfinite(scores).all().item()):
++            raise FloatingPointError("LES scores contain NaN or Inf")
++        centred = (scores - scores.mean()).clamp(-clip, clip)
++        if noise is None:
++            return torch.exp(strength * centred)
++        # PGS exploration: Gumbel-perturbed log-multipliers, bounded so a single draw cannot dominate DivPrune.
++        return torch.exp((strength * centred + noise.to(centred)).clamp(-2.0 * strength * clip - 6.0,
++                                                                         2.0 * strength * clip + 6.0))
++
++
++class QueryAwareScorer(nn.Module):
++    """query-conditioned selector: (post-merger visual embedding, question token embeddings) -> score.
++
++    s_i = w_o . gelu(h_i + c_i + h_i * c_i) + w_r * max_j cos(v_i, q_j), where h_i = W_v LN(v_i) and
++    c_i is cross-attention of h_i over the question tokens.  w_o and w_r start at zero, so every token scores
++    exactly 0 at step 0 and selection is plain DivPrune.  Inputs are detached: the scorer never trains the
++    vision tower or the word embeddings.  With num_slots > 0 it also owns the QSlot soft-patch generator.
++    """
++
++    def __init__(self, input_hidden_size: int, hidden_size: int = 64, num_slots: int = 0) -> None:
++        super().__init__()
++        d, h = int(input_hidden_size), int(hidden_size)
++        self.hidden_size = h
++        self.input = nn.Linear(d, h)
++        self.query_key = nn.Linear(d, h)
++        self.query_value = nn.Linear(d, h)
++        self.output = nn.Linear(h, 1)
++        self.relevance_weight = nn.Parameter(torch.zeros(1))
++        self.num_slots = int(num_slots)
++        if self.num_slots > 0:
++            self.slot_queries = nn.Parameter(torch.zeros(self.num_slots, h))
++            self.slot_key = nn.Linear(d, h)
++            self.slot_log_scale = nn.Parameter(torch.zeros(1))
++        self.reset_parameters()
++
++    def reset_parameters(self) -> None:
++        generator = torch.Generator().manual_seed(20261101)
++        for layer in (self.input, self.query_key, self.query_value) + ((self.slot_key,) if self.num_slots else ()):
++            with torch.no_grad():
++                layer.weight.copy_(torch.randn(layer.weight.shape, generator=generator) * 0.02)
++                layer.bias.zero_()
++        nn.init.zeros_(self.output.weight)
++        nn.init.zeros_(self.output.bias)
++        nn.init.zeros_(self.relevance_weight)
++        if self.num_slots:
++            with torch.no_grad():
++                self.slot_queries.copy_(torch.randn(self.slot_queries.shape, generator=generator))
++            nn.init.zeros_(self.slot_log_scale)
++
++    def _normed(self, x: torch.Tensor) -> torch.Tensor:
++        x = x.detach().to(self.input.weight.dtype)
++        return F.layer_norm(x, (x.shape[-1],))
++
++    def _query_context(self, query_embeds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        q = self._normed(query_embeds)
++        return self.query_key(q), self.query_value(q)
++
++    def forward(self, embeds: torch.Tensor, query_embeds: torch.Tensor, chunk_tokens: int = 4096) -> torch.Tensor:
++        if query_embeds is None or query_embeds.ndim != 2 or query_embeds.shape[0] == 0:
++            raise ValueError("QueryAwareScorer needs non-empty [query_tokens, hidden] question embeddings")
++        keys, values = self._query_context(query_embeds)
++        q_unit = F.normalize(query_embeds.detach().float(), dim=-1)
++        scale = 1.0 / math.sqrt(self.hidden_size)
++        scores = []
++        for start in range(0, embeds.shape[0], chunk_tokens):
++            chunk = embeds[start:start + chunk_tokens]
++            h = self.input(self._normed(chunk))
++            attention = torch.softmax((h @ keys.transpose(0, 1)).float() * scale, dim=-1).to(h.dtype)
++            c = attention @ values
++            learned = self.output(F.gelu(h + c + h * c)).squeeze(-1).float()
++            relevance = (F.normalize(chunk.detach().float(), dim=-1) @ q_unit.transpose(0, 1)).amax(dim=-1)
++            scores.append(learned + self.relevance_weight.float() * relevance)
++        return torch.cat(scores, dim=0)
++
++    def slots(self, embeds: torch.Tensor, query_embeds: torch.Tensor) -> torch.Tensor:
++        """QSlot: num_slots query-conditioned convex combinations of the image's post-merger tokens.
++
++        Slot m attends over all N tokens with query (slot_queries[m] + mean question value).  Outputs are convex
++        combinations of real embeddings (same scale as image tokens; never the zero vector that broke the DINO
++        tokens' RMSNorm), and gradients reach the vision tower through the values.
++        """
++        if self.num_slots <= 0:
++            raise RuntimeError("QSlot is disabled for this scorer")
++        _, values = self._query_context(query_embeds)
++        slot_query = self.slot_queries.to(values.dtype) * 0.02 + values.mean(dim=0, keepdim=True)
++        keys = self.slot_key(self._normed(embeds))
++        logits = (slot_query @ keys.transpose(0, 1)).float() / math.sqrt(self.hidden_size)
++        attention = torch.softmax(logits * torch.exp(self.slot_log_scale.float()).clamp(max=100.0), dim=-1)
++        return (attention.to(embeds.dtype) @ embeds)
++
++
++def _sincos_2d(rows: torch.Tensor, cols: torch.Tensor, gh: int, gw: int, dim: int) -> torch.Tensor:
++    """2-D sine-cosine embedding of normalized cell centers (identical to scorer/train_selector.py)."""
++    y = (rows.float() + 0.5) / gh
++    x = (cols.float() + 0.5) / gw
++    freq = torch.exp(torch.arange(dim // 4, device=rows.device) * (-math.log(100.0) / max(dim // 4 - 1, 1)))
++    parts = []
++    for p in (y, x):
++        a = p[:, None] * freq[None] * math.pi * 8
++        parts += [a.sin(), a.cos()]
++    return torch.cat(parts, dim=-1)
++
++
++def grid_from_coordinates(coordinates: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int, int]:
++    """Merged-token (row, col) and grid size from one image span's M-RoPE (t, h, w) coordinates."""
++    rows = coordinates[:, 1].long() - coordinates[:, 1].long().min()
++    cols = coordinates[:, 2].long() - coordinates[:, 2].long().min()
++    gh, gw = int(rows.max()) + 1, int(cols.max()) + 1
++    if gh * gw != coordinates.shape[0]:
++        raise ValueError(f"image span is not a full {gh}x{gw} grid ({coordinates.shape[0]} tokens)")
++    return rows, cols, gh, gw
++
++
++def box_coverage(rows: torch.Tensor, cols: torch.Tensor, gh: int, gw: int, boxes: torch.Tensor) -> torch.Tensor:
++    """Per-token fraction of the token cell covered by each normalized box: [num_boxes, N] (float32)."""
++    y0, y1 = rows.float() / gh, (rows + 1).float() / gh
++    x0, x1 = cols.float() / gw, (cols + 1).float() / gw
++    b = boxes.float().to(rows.device)
++    ix = (torch.minimum(x1[None], b[:, 2:3]) - torch.maximum(x0[None], b[:, 0:1])).clamp_min(0)
++    iy = (torch.minimum(y1[None], b[:, 3:4]) - torch.maximum(y0[None], b[:, 1:2])).clamp_min(0)
++    return (ix * iy * gh * gw).clamp(max=1.0)
++
++
++class QSelScorer(nn.Module):
++    """BG-OPD scorer: the evidence scorer of scorer/train_selector.py, same parameter names,
++    so its box-label-pretrained checkpoint loads directly. Returns (answer-relevance logits, text logits)."""
++
++    def __init__(self, input_hidden_size: int, hidden_size: int = 256, heads: int = 4,
++                 init_checkpoint: Optional[str] = None) -> None:
++        super().__init__()
++        d, h = int(input_hidden_size), int(hidden_size)
++        self.h = h
++        self.v = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, h))
++        self.q = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, h))
++        self.pos = nn.Linear(h, h)
++        self.cross = nn.MultiheadAttention(h, heads, batch_first=True)
++        self.out = nn.Sequential(nn.LayerNorm(3 * h), nn.Linear(3 * h, h), nn.GELU(), nn.Linear(h, 2))
++        self.init_source = None
++        if init_checkpoint:
++            from pathlib import Path as _Path
++            path = _Path(init_checkpoint)
++            if not path.is_file():
++                raise FileNotFoundError(f"QSel init checkpoint not found: {init_checkpoint}")
++            payload = torch.load(str(path), map_location="cpu", weights_only=False)
++            if int(payload.get("hidden", h)) != h or int(payload.get("d", d)) != d:
++                raise ValueError(f"QSel checkpoint shape mismatch: {payload.get('d')}x{payload.get('hidden')} vs {d}x{h}")
++            self.load_state_dict(payload["state_dict"], strict=True)
++            self.init_source = str(path)
++            print(f"[BG-OPD] QSel scorer initialized from {path}", flush=True)
++
++    def forward(self, v: torch.Tensor, q: torch.Tensor, coordinates: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        rows, cols, gh, gw = grid_from_coordinates(coordinates)
++        dtype = self.v[1].weight.dtype
++        hv = self.v(v.detach().to(dtype)) + self.pos(_sincos_2d(rows, cols, gh, gw, self.h).to(dtype))
++        hq = self.q(q.detach().to(dtype))
++        ctx, _ = self.cross(hv[None], hq[None], hq[None], need_weights=False)
++        ctx = ctx[0]
++        pooled = hq.mean(0, keepdim=True).expand_as(hv)
++        logits = self.out(torch.cat([hv, ctx, hv * pooled], dim=-1)).float()
++        return logits[:, 0], logits[:, 1]
++
++
++def box_label_losses(rel: torch.Tensor, txt: torch.Tensor, coordinates: torch.Tensor, boxes: torch.Tensor,
++                     kinds: torch.Tensor, *, text_coef: float) -> tuple[Optional[torch.Tensor], dict]:
++    """SparseMM-style alignment target: every answer box maps to the merged tokens it covers; each box's coverage is
++    normalized by its own size (a small box concentrates its unit mass, as SparseMM's 1/|I_y| hit weight), and the
++    target is the mean over boxes. Loss = CE(softmax(rel), target) + text_coef * BCE(txt, any-OCR-box coverage).
++    ``info["answer_mask"]`` is the set of tokens touched by any answer box (SparseMM's I_y)."""
++    rows, cols, gh, gw = grid_from_coordinates(coordinates)
++    answer = boxes[kinds == 1]
++    ocr = boxes[kinds == 2]
++    terms, info = [], {}
++    if answer.numel():
++        cover = box_coverage(rows, cols, gh, gw, answer)
++        mass = cover.sum(dim=1)
++        cover = cover[mass > 0]
++        if cover.numel():
++            target = (cover / cover.sum(dim=1, keepdim=True)).mean(dim=0)
++            terms.append(-(target * torch.log_softmax(rel.float(), dim=0)).sum())
++            budget = max(1, min(rel.numel(), max(32, math.ceil(0.05 * rel.numel()))))
++            top = torch.topk(rel.detach(), budget).indices
++            info["recall"] = float(target[top].sum())
++            info["answer_mask"] = (cover.amax(dim=0) > 0).detach()
++    if ocr.numel() and text_coef > 0:
++        any_text = (box_coverage(rows, cols, gh, gw, ocr).amax(dim=0) > 0).float()
++        terms.append(text_coef * F.binary_cross_entropy_with_logits(txt.float(), any_text))
++    if not terms:
++        return None, info
++    return sum(terms), info
++
++
++def _group_softmax(values: torch.Tensor, groups: torch.Tensor, num_groups: int) -> torch.Tensor:
++    values = values.float()
++    maxima = values.new_full((num_groups,), -torch.inf).scatter_reduce(0, groups, values, reduce="amax")
++    shifted = torch.exp(values - maxima.index_select(0, groups))
++    totals = values.new_zeros((num_groups,)).scatter_add(0, groups, shifted)
++    return shifted / totals.index_select(0, groups).clamp_min(1e-20)
++
++
++class _SwapGainTap(torch.autograd.Function):
++    """CSD: identity on the reduced slots; in backward, turns the slot gradients into a scorer gradient.
++
++    For a discarded token i assigned to slot k (anchor a_k), the first-order change of the OPD loss if i
++    replaced a_k is  dL ~= <g_k, x_i - x_{a_k}>.  gain_i = -dL is normalised per image and turned into a
++    per-slot target distribution p = softmax_group(gain / T) (the anchor has gain 0).  The scorer's per-slot
++    softmax q receives the ListNet / KL(p || q) gradient  coef * (q - p) / K.
++    """
++
++    @staticmethod
++    def forward(ctx, reduced, scores, sources, selected, assignment, coef, temperature, chunk_tokens):
++        ctx.save_for_backward(scores.detach(), sources.detach(), selected, assignment)
++        ctx.coef, ctx.temperature, ctx.chunk_tokens = float(coef), float(temperature), int(chunk_tokens)
++        return reduced.clone()
++
++    @staticmethod
++    def backward(ctx, grad_reduced):
++        scores, sources, selected, assignment = ctx.saved_tensors
++        grad_scores = None
++        if ctx.needs_input_grad[1] and grad_reduced is not None:
++            with torch.no_grad():
++                g = grad_reduced.float()
++                k = g.shape[0]
++                anchor_dot = (g * sources.index_select(0, selected).float()).sum(-1)
++                gain = torch.empty(sources.shape[0], device=g.device, dtype=torch.float32)
++                for start in range(0, sources.shape[0], ctx.chunk_tokens):
++                    end = min(start + ctx.chunk_tokens, sources.shape[0])
++                    slots = assignment[start:end]
++                    gain[start:end] = -((g.index_select(0, slots) * sources[start:end].float()).sum(-1)
++                                        - anchor_dot.index_select(0, slots))
++                gain[selected] = 0.0
++                scale = gain.abs().mean().clamp_min(1e-20)
++                target = _group_softmax(gain / scale / ctx.temperature, assignment, k)
++                predicted = _group_softmax(scores, assignment, k)
++                grad_scores = (ctx.coef * (predicted - target) / k).to(scores.dtype)
++        return grad_reduced, grad_scores, None, None, None, None, None, None
++
++
+ class VisionDARTMergeCompressor(nn.Module):
+     """Legacy fixed-quota conditional-diversity path."""
+ 
+@@ -2675,6 +3264,8 @@
+             selector=str(config.get("selector", "cdpruner")),
+             divprune_seed=str(config.get("divprune_seed", "nearest_neighbor")),
+             global_tokens=config.get("global_tokens"),
++            importance=config.get("importance"),
++            efficient_vit=config.get("efficient_vit"),
+         )
+ 
+     if algorithm == LEGACY_CONDITIONAL_DIVERSITY_ALGORITHM and allow_legacy:
+@@ -2884,10 +3475,15 @@
+         current_row_coordinates: list[Optional[torch.Tensor]] = []
+         current_row_routes: list[HoliTomDPCSpatialMergeRoute] = []
+         row_query_embeds = None
++        row_query_ids = None
+         if routes is None and not holitom_merge:
+             row_query_embeds = inputs_embeds[batch_idx][query_mask[batch_idx]]
++            row_query_ids = ids[query_mask[batch_idx]]
+             if row_query_embeds.shape[0] == 0:
+                 raise ValueError(f"No inference-visible query tokens for batch row {batch_idx}")
++        query_aware = bool(getattr(compressor, "query_aware_selector", False))
++        if query_aware:
++            compressor.selector_current_row = batch_idx
+ 
+         pieces: list[torch.Tensor] = []
+         mask_pieces: list[torch.Tensor] = []
+@@ -2927,11 +3523,21 @@
+                 )
+                 if same_source and same_coordinates:
+                     replay_route = previous_row_routes[span_index]
++            span_query_embeds = row_query_embeds
++            if query_aware and replay_route is not None:
++                # Training-time replay: rebuild the question embeddings from the ids the rollout recorded.
++                if replay_route.query_token_ids is None:
++                    raise ValueError("Query-aware replay route carries no question token ids")
++                span_query_embeds = model.get_input_embeddings()(
++                    replay_route.query_token_ids.to(device=inputs_embeds.device, dtype=torch.long)
++                ).detach()
++            compressor_kwargs = {"query_token_ids": row_query_ids} if query_aware else {}
+             reduced, route = compressor(
+                 span_embeds,
+                 replay_route,
+-                query_embeds=row_query_embeds,
++                query_embeds=span_query_embeds,
+                 image_coordinates=span_coordinates,
++                **compressor_kwargs,
+             )
+             if global_embeds is not None:
+                 if image_index >= global_embeds.shape[0]:
+@@ -2943,6 +3549,14 @@
+                 )
+                 if pos_pieces is not None:
+                     pos_pieces.append(position_ids_work[:, batch_idx, start : start + 1].expand(-1, global_span.shape[0]))
++            if query_aware and compressor.selector_mode == "qslot":
++                slot_span = compressor.importance_scorer.slots(span_embeds, span_query_embeds)
++                pieces.append(slot_span.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype))
++                mask_pieces.append(
++                    torch.ones((slot_span.shape[0],), device=attention_mask.device, dtype=attention_mask.dtype)
++                )
++                if pos_pieces is not None:
++                    pos_pieces.append(position_ids_work[:, batch_idx, start : start + 1].expand(-1, slot_span.shape[0]))
+             image_index += 1
+             pieces.append(reduced.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype))
+             mask_pieces.append(
+--- a/learnable_merge/verl/trainer/ppo/core_algos.py
++++ b/learnable_merge/verl/trainer/ppo/core_algos.py
+@@ -1116,6 +1116,7 @@
+     global_batch_size: Optional[int] = None,
+     loss_scale_factor: Optional[int] = None,
+     dp_size: int = 1,
++    token_weights: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, dict[str, Any]]:
+ 
+     if loss_agg_mode != "seq-mean-token-mean":
+@@ -1226,6 +1227,12 @@
+     if rollout_is_weights is not None:
+         weighted_per_token_loss = weighted_per_token_loss * rollout_is_weights
+ 
++    # OPD variants: detached per-token weights (SVG gap and/or outcome calibration).
++    if token_weights is not None:
++        if token_weights.shape != weighted_per_token_loss.shape:
++            raise ValueError(f"token_weights shape {tuple(token_weights.shape)} != loss {tuple(weighted_per_token_loss.shape)}")
++        weighted_per_token_loss = weighted_per_token_loss * token_weights.detach().to(weighted_per_token_loss.dtype)
++
+     valid_token_count = loss_mask.sum().clamp(min=1.0)
+     if student_tail_probability is not None and teacher_tail_probability is not None:
+         metrics["self_distillation/student_tail_mass_token_mean"] = (
+--- a/learnable_merge/verl/trainer/ppo/ray_trainer.py
++++ b/learnable_merge/verl/trainer/ppo/ray_trainer.py
+@@ -435,6 +435,17 @@
+         self.tokenizer.truncation_side = config.actor_rollout_ref.actor.get("self_distillation", {}).get("reprompt_truncation", "error")
+         self.processor = processor
+         self.config = config
++        # the driver deserializes and validates rollout routes without building a compressor, so it must
++        # know about adaptive per-image budgets too (the workers set the flag when they build theirs).
++        _vtc_cfg = config.actor_rollout_ref.model.get("vision_token_compressor") or {}
++        _imp_cfg = _vtc_cfg.get("importance") or {}
++        if bool(_imp_cfg.get("budget_adaptive", False)):
++            from verl.models.transformers import vision_token_compressor as _vtc
++
++            _vtc.ADAPTIVE_BUDGET.update(
++                enabled=True, m_lo=float(_imp_cfg.get("budget_m_lo", 0.6)), m_hi=float(_imp_cfg.get("budget_m_hi", 3.0)),
++                kmax=float(_imp_cfg.get("budget_kmax", 0.25)),
++            )
+         custom_chat_template = resolve_custom_chat_template(self.config.actor_rollout_ref.model)
+         if custom_chat_template is not None:
+             if self.processor is not None:
+@@ -3112,6 +3123,48 @@
+                         self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
+                         if self_distillation_data is not None:
+                             self_distillation_batch, self_distillation_metrics = self_distillation_data
++                            opd_variant = str(
++                                self.config.actor_rollout_ref.actor.self_distillation.get("opd_variant", "vanilla")
++                            )
++                            if opd_variant in ("outcome", "svg_outcome"):
++                                # OC-OPD: judge each on-policy rollout against the row's gold answer.
++                                import opd_variants as _opd_variants
++
++                                missing = [k for k in ("task_type", "answer") if k not in batch.non_tensor_batch]
++                                if missing:
++                                    raise RuntimeError(f"OC-OPD needs dataset columns {missing} in non_tensor_batch")
++                                student_correct, gold_tokens, outcome_metrics = _opd_variants.batch_outcome_tensors(
++                                    self.tokenizer,
++                                    batch.batch["responses"].cpu(),
++                                    batch.batch["response_mask"].cpu(),
++                                    [str(x) for x in batch.non_tensor_batch["task_type"]],
++                                    [None if x is None else str(x) for x in batch.non_tensor_batch["answer"]],
++                                )
++                                self_distillation_batch.batch["outcome_student_correct"] = student_correct
++                                self_distillation_batch.batch["outcome_gold_tokens"] = gold_tokens
++                                self_distillation_metrics.update(outcome_metrics)
++                            importance_cfg = (
++                                self.config.actor_rollout_ref.model.get("vision_token_compressor", {}) or {}
++                            ).get("importance", {}) or {}
++                            if importance_cfg.get("enabled", False) and importance_cfg.get("mode") == "box":
++                                # BG-OPD: box labels + SparseMM answer-token alignment of the n=1 rollout.
++                                import selector_methods as _selector_methods
++
++                                missing = [k for k in ("task_type", "answer", "extra_info")
++                                           if k not in batch.non_tensor_batch]
++                                if missing:
++                                    raise RuntimeError(f"BG-OPD needs dataset columns {missing} in non_tensor_batch")
++                                box_tensors, box_metrics = _selector_methods.batch_box_tensors(
++                                    self.tokenizer,
++                                    batch.batch["responses"].cpu(),
++                                    batch.batch["response_mask"].cpu(),
++                                    [str(x) for x in batch.non_tensor_batch["task_type"]],
++                                    [None if x is None else str(x) for x in batch.non_tensor_batch["answer"]],
++                                    list(batch.non_tensor_batch["extra_info"]),
++                                )
++                                for key, value in box_tensors.items():
++                                    self_distillation_batch.batch[key] = value
++                                self_distillation_metrics.update(box_metrics)
+                             batch = batch.union(self_distillation_batch)
+                             metrics.update(self_distillation_metrics)
+ 
+--- a/learnable_merge/verl/utils/dataset/vqa20k_sampler.py
++++ b/learnable_merge/verl/utils/dataset/vqa20k_sampler.py
+@@ -56,6 +56,11 @@
+ _FULLIMAGE_HAMILTON_HALF_BATCHES = 350
+ _FULLIMAGE15K_HAMILTON_QUOTAS = _HAMILTON_QUOTAS + (2000,)
+ _FULLIMAGE15K_HAMILTON_HALF_BATCHES = 375
++# LT-14K-spatial ablation: 1,500 spatial MCQ rows (SAT static + COCO train2017) replace a proportional share of the
++# nine LT-14K buckets; 14,000 rows and the 350-half-batch schedule are unchanged.
++FULLIMAGE14K_SPATIAL_HAMILTON_SAMPLER_STATE_SCHEMA = "vision_opd_v8_vqa14k_fullimage_spatial_balanced_sampler_state_v1"
++_SPATIAL_HAMILTON_BUCKET_ORDER = _FULLIMAGE_HAMILTON_BUCKET_ORDER + ("spatial",)
++_SPATIAL_HAMILTON_QUOTAS = (2678, 1339, 804, 804, 804, 2678, 1607, 893, 893, 1500)
+ _ORDER_GROUPS = 8
+ DATA_MIXTURE = {'accepted_train_rows': 14000,
+  'sampling_seed': 20260824,
+@@ -111,6 +116,18 @@
+ )
+ DATA_MIXTURE_15K["global_batch"]["exact_epoch_bucket_quotas"]["vision_opd_fullimage_mcq"] = 2000
+ 
++DATA_MIXTURE_14K_SPATIAL = deepcopy(DATA_MIXTURE)
++DATA_MIXTURE_14K_SPATIAL["vqa20k_sampler_state_schema"] = FULLIMAGE14K_SPATIAL_HAMILTON_SAMPLER_STATE_SCHEMA
++_spatial_quotas = dict(zip(_SPATIAL_HAMILTON_BUCKET_ORDER, _SPATIAL_HAMILTON_QUOTAS))
++DATA_MIXTURE_14K_SPATIAL["global_batch"]["exact_epoch_bucket_quotas"] = dict(_spatial_quotas)
++DATA_MIXTURE_14K_SPATIAL["global_batch"]["hamilton_tie_break_bucket_order"] = list(_SPATIAL_HAMILTON_BUCKET_ORDER)
++DATA_MIXTURE_14K_SPATIAL["sources"]["onethinker"] = {
++    "rows": sum(_spatial_quotas[f"onethinker_{name}"] for name in ("mcq", "math", "numerical", "ocr", "regression")),
++    "strata": {name: _spatial_quotas[f"onethinker_{name}"] for name in ("mcq", "math", "numerical", "ocr", "regression")},
++}
++for _name in ("pixmo_ask_model_anything", "llava_v1_5_mix665k", "textvqa", "vision_opd_fullimage_mcq", "spatial"):
++    DATA_MIXTURE_14K_SPATIAL["sources"][_name] = {"rows": _spatial_quotas[_name]}
++
+ _SOURCE_BUCKET = {
+     "pixmo_ask_model_anything": "pixmo_ask_model_anything",
+     "llava_v1_5_mix665k": "llava_v1_5_mix665k",
+@@ -163,6 +180,8 @@
+         result[_SOURCE_BUCKET["textvqa"]] = int(sources["textvqa"]["rows"])
+     if "vision_opd_fullimage_mcq" in sources:
+         result["vision_opd_fullimage_mcq"] = int(sources["vision_opd_fullimage_mcq"]["rows"])
++    if "spatial" in sources:
++        result["spatial"] = int(sources["spatial"]["rows"])
+     return result
+ 
+ 
+@@ -185,6 +204,8 @@
+ def _hamilton_layout(*, state_schema, algorithm):
+     if algorithm != FULLIMAGE_HAMILTON_SAMPLER_ALGORITHM:
+         raise ValueError(f"Unsupported full-image sampler algorithm: {algorithm!r}")
++    if state_schema == FULLIMAGE14K_SPATIAL_HAMILTON_SAMPLER_STATE_SCHEMA:
++        return (_SPATIAL_HAMILTON_BUCKET_ORDER, _SPATIAL_HAMILTON_QUOTAS, _FULLIMAGE_HAMILTON_HALF_BATCHES, "LT-14K-spatial")
+     if state_schema == FULLIMAGE15K_HAMILTON_SAMPLER_STATE_SCHEMA:
+         return (_FULLIMAGE_HAMILTON_BUCKET_ORDER, _FULLIMAGE15K_HAMILTON_QUOTAS,
+                 _FULLIMAGE15K_HAMILTON_HALF_BATCHES, "LT-15K")
+@@ -326,7 +347,7 @@
+             f"Hamilton {release_name} outer_steps drift: "
+             f"expected={expected_outer_steps}, actual={global_batch['outer_steps']!r}"
+         )
+-    if state_schema == FULLIMAGE_HAMILTON_SAMPLER_STATE_SCHEMA:
++    if state_schema in (FULLIMAGE_HAMILTON_SAMPLER_STATE_SCHEMA, FULLIMAGE14K_SPATIAL_HAMILTON_SAMPLER_STATE_SCHEMA):
+         if half_batches % 2 or expected_rows % 80:
+             raise RuntimeError("Hamilton VQA14K full-image layout must not have a partial outer batch")
+         if "has_partial_outer_batch" in global_batch and global_batch["has_partial_outer_batch"] is not False:
+@@ -540,7 +561,7 @@
+ 
+     def __init__(self, data_source: Sized, data_config: Any):
+         mixture = _config_get(data_config, "vqa20k_mixture", "lt14k")
+-        mixtures = {"lt14k": DATA_MIXTURE, "lt15k": DATA_MIXTURE_15K}
++        mixtures = {"lt14k": DATA_MIXTURE, "lt15k": DATA_MIXTURE_15K, "lt14k_spatial": DATA_MIXTURE_14K_SPATIAL}
+         if mixture not in mixtures:
+             raise ValueError(f"Unsupported LT-OPD mixture: {mixture!r}")
+         data_contract = mixtures[mixture]
+--- a/learnable_merge/verl/workers/actor/dp_actor.py
++++ b/learnable_merge/verl/workers/actor/dp_actor.py
+@@ -379,18 +379,27 @@
+         *,
+         module: nn.Module,
+         micro_batch_size: int,
++        allow_current_actor: bool = False,
+         **forward_kwargs,
+     ) -> dict[str, torch.Tensor]:
+-        """Run the immutable dense teacher with a rank-synchronous small batch."""
++        """Run the immutable dense teacher with a rank-synchronous small batch.
++
++        allow_current_actor=True (SVG-OPD) runs the trainable actor on the dense view instead; the caller
++        must wrap it in torch.no_grad().
++        """
+ 
+         if self.config.get("training_mode", "legacy") != "full_parameter":
+             raise RuntimeError("Fixed-teacher chunking is restricted to the full-parameter path")
+         if isinstance(micro_batch_size, bool) or not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
+             raise ValueError("teacher micro_batch_size must be a positive integer")
+-        if module is None or module is self.actor_module:
+-            raise RuntimeError("Fixed teacher must be separate from the current actor")
+-        if module.training or any(parameter.requires_grad for parameter in module.parameters()):
+-            raise RuntimeError("Fixed teacher must remain frozen in eval mode")
++        if allow_current_actor:
++            if module is not self.actor_module or torch.is_grad_enabled():
++                raise RuntimeError("allow_current_actor requires the current actor under torch.no_grad()")
++        else:
++            if module is None or module is self.actor_module:
++                raise RuntimeError("Fixed teacher must be separate from the current actor")
++            if module.training or any(parameter.requires_grad for parameter in module.parameters()):
++                raise RuntimeError("Fixed teacher must remain frozen in eval mode")
+         responses = teacher_inputs.get("responses")
+         if not isinstance(responses, torch.Tensor) or responses.ndim == 0:
+             raise ValueError("Teacher chunking requires batch-aligned responses")
+@@ -631,6 +640,7 @@
+         attention_mask: torch.Tensor,
+         response_length: int,
+         response_start_idx: Optional[torch.Tensor],
++        routes=None,
+     ) -> torch.Tensor:
+         unwrapped = DataParallelPPOActor._get_unwrapped_module(module)
+         nested_model = getattr(unwrapped, "model", None)
+@@ -678,8 +688,33 @@
+             summary_enabled=bool(getattr(compressor, "summary_enabled", False)),
+             # DINO global tokens are prepended to every compressed span; leaving them out shifts the response
+             # logits into the prompt tail.
+-            global_tokens_per_image=int(getattr(getattr(compressor, "global_tokens", None), "num_tokens", 0) or 0),
++            global_tokens_per_image=(
++                int(compressor.extra_tokens_per_image()) if hasattr(compressor, "extra_tokens_per_image")
++                else int(getattr(getattr(compressor, "global_tokens", None), "num_tokens", 0) or 0)
++            ),
+         )
++        from verl.models.transformers import vision_token_compressor as _vtc
++
++        if _vtc.ADAPTIVE_BUDGET["enabled"] and routes is None:
++            raise RuntimeError("Adaptive visual budgets need the replayed routes to place the response logits")
++        if _vtc.ADAPTIVE_BUDGET["enabled"]:
++            # per-image budgets differ, so count each span's replayed route instead of the fixed rule.
++            extra = (
++                int(compressor.extra_tokens_per_image()) if hasattr(compressor, "extra_tokens_per_image")
++                else int(getattr(getattr(compressor, "global_tokens", None), "num_tokens", 0) or 0)
++            )
++            route_iter = iter(routes)
++            counts = []
++            for row in image_mask:
++                total = 0
++                for _start, _end in _vtc._contiguous_true_spans(row.to(torch.bool)):
++                    route = next(route_iter)
++                    tokens = route["output_tokens"] if isinstance(route, dict) else route.output_tokens
++                    total += int(tokens) + extra
++                counts.append(total)
++            if next(route_iter, None) is not None:
++                raise ValueError("More replay routes than image spans while counting adaptive budgets")
++            new_image_tokens = torch.tensor(counts, device=input_ids.device, dtype=torch.long)
+         return response_start_idx - (old_image_tokens - new_image_tokens)
+ 
+     @staticmethod
+@@ -1114,6 +1149,7 @@
+                     attention_mask=attention_mask,
+                     response_length=response_length,
+                     response_start_idx=response_start_idx,
++                    routes=dart_merge_routes,
+                 )
+             if response_start_idx is not None:
+                 response_start_idx = response_start_idx.to(device=input_ids.device, dtype=torch.long)
+@@ -1792,6 +1828,10 @@
+         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
+         if "rollout_log_probs" in data.batch.keys():
+             select_keys.append("rollout_log_probs")
++        for outcome_key in ("outcome_student_correct", "outcome_gold_tokens",
++                            "box_label_boxes", "box_label_kinds", "box_aligned_mask"):
++            if outcome_key in data.batch.keys():
++                select_keys.append(outcome_key)
+ 
+         has_multi_modal_inputs = self._has_non_empty_multi_modal_inputs(
+             data.non_tensor_batch.get("multi_modal_inputs")
+@@ -1994,6 +2034,23 @@
+                             teacher_seed_indices = teacher_seed_outputs["topk_indices"]
+                             teacher_seed_time = time.perf_counter() - teacher_seed_start
+                         stage_wall_time_totals["timing_s/update_actor/teacher_forward"] += teacher_seed_time
++                    # query-aware selectors: fresh per-micro-batch score records / CSD gradient scale.
++                    import selector_methods as _selector_methods
++
++                    selector_compressor = _selector_methods.find_compressor(self.actor_module)
++                    selector_mode = selector_compressor.selector_mode if selector_compressor is not None else None
++                    from verl.models.transformers import efficient_vit as _efficient_vit
++
++                    _efficient_vit.clear_aux(self.actor_module)
++                    if selector_compressor is not None:
++                        selector_compressor.selector_records = []
++                        selector_compressor.selector_grad_scale = float(micro_batch_scale_factor)
++                        if selector_mode == "box":
++                            if "box_label_boxes" not in model_inputs:
++                                raise RuntimeError("BG-OPD needs box_label_boxes/box_label_kinds from the trainer")
++                            selector_compressor.selector_box_labels = (
++                                model_inputs["box_label_boxes"], model_inputs["box_label_kinds"]
++                            )
+                     student_forward_start = time.perf_counter()
+                     outputs = self._forward_micro_batch(
+                         model_inputs,
+@@ -2070,6 +2127,26 @@
+                             self.teacher_module is None or self.teacher_module is self.actor_module
+                         ):
+                             raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
++                        ted_capture = None
++                        if selector_mode == "ted" and selector_compressor.selector_records:
++                            ted_capture = _selector_methods.TeacherEvidenceCapture(
++                                teacher_model,
++                                response_length=int(model_inputs["responses"].shape[-1]),
++                                layer=selector_compressor.importance_config["ted_layer"],
++                                tau=selector_compressor.importance_config["ted_tau"],
++                                standardize=selector_compressor.importance_config["ted_standardize"],
++                            )
++                        svh_capture = None
++                        if (
++                            selector_mode == "box"
++                            and selector_compressor.importance_config["svh_coef"] > 0
++                            and selector_compressor.selector_records
++                        ):
++                            svh_capture = _selector_methods.VisualHeadCapture(
++                                teacher_model,
++                                response_length=int(model_inputs["responses"].shape[-1]),
++                                aligned_mask=model_inputs.get("box_aligned_mask"),
++                            )
+                         with torch.no_grad():
+                             teacher_forward_start = time.perf_counter()
+                             teacher_forward_kwargs = {
+@@ -2101,6 +2178,14 @@
+                                     teacher_inputs, module=teacher_model, **teacher_forward_kwargs
+                                 )
+                             teacher_forward_time = time.perf_counter() - teacher_forward_start
++                        if ted_capture is not None:
++                            ted_capture.close()
++                        svh_evidence = None
++                        if svh_capture is not None:
++                            svh_capture.close()
++                            if svh_capture.calls == 0:
++                                raise RuntimeError("SVH capture saw no teacher softmax-attention calls")
++                            svh_evidence = svh_capture.finalize()
+                         stage_wall_time_totals["timing_s/update_actor/teacher_forward"] += teacher_forward_time
+                         teacher_log_prob = teacher_outputs["log_probs"]
+                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+@@ -2136,6 +2221,85 @@
+                                         "rollout_token_ids": model_inputs["responses"][valid_rows].detach().cpu(),
+                                     }
+                                 )
++                        opd_variant = str(self_distillation_cfg.get("opd_variant", "vanilla"))
++                        opd_token_weights = None
++                        opd_variant_metrics = {}
++                        if opd_variant != "vanilla":
++                            import opd_variants as _opd_variants
++
++                            if not distill_topk or student_topk_logps is None or teacher_topk_logps is None:
++                                raise ValueError(f"opd_variant={opd_variant} requires top-k union-support distillation")
++                            opd_token_weights = response_mask.to(torch.float32).clone()
++                            if opd_variant in ("svg", "svg_outcome"):
++                                if not self._has_non_empty_multi_modal_inputs(teacher_inputs.get("multi_modal_inputs")):
++                                    raise RuntimeError("SVG-OPD needs dense multimodal teacher inputs for the self view")
++                                with torch.no_grad():
++                                    svg_start = time.perf_counter()
++                                    svg_kwargs = {
++                                        "temperature": temperature,
++                                        "calculate_entropy": False,
++                                        "return_all_logps": False,
++                                        "distill_topk": distill_topk,
++                                        "topk_indices": student_topk_indices,
++                                        "topk_valid_mask": student_topk_valid_mask,
++                                        "visual_compression_mode": "dense",
++                                    }
++                                    if self.config.get("training_mode", "legacy") == "full_parameter":
++                                        svg_outputs = self._forward_fixed_teacher_in_chunks(
++                                            teacher_inputs,
++                                            module=self.actor_module,
++                                            micro_batch_size=int(
++                                                self.config.vision_packing["teacher_micro_batch_size_per_gpu"]
++                                            ),
++                                            allow_current_actor=True,
++                                            **svg_kwargs,
++                                        )
++                                    else:
++                                        svg_outputs = self._forward_micro_batch(
++                                            teacher_inputs, module=self.actor_module, **svg_kwargs
++                                        )
++                                    svg_time = time.perf_counter() - svg_start
++                                stage_wall_time_totals["timing_s/update_actor/svg_dense_self_forward"] = (
++                                    stage_wall_time_totals.get("timing_s/update_actor/svg_dense_self_forward", 0.0)
++                                    + svg_time
++                                )
++                                svg_weights, svg_gap = _opd_variants.svg_token_weights(
++                                    svg_outputs["topk_logps"],
++                                    student_topk_logps,
++                                    student_topk_valid_mask,
++                                    response_mask,
++                                    eta=float(self_distillation_cfg.get("svg_eta", 0.5)),
++                                    max_weight=float(self_distillation_cfg.get("svg_max_weight", 5.0)),
++                                )
++                                opd_token_weights = opd_token_weights * svg_weights
++                                valid_tokens = response_mask.sum().clamp(min=1)
++                                opd_variant_metrics["svg/view_gap_token_mean"] = (svg_gap.sum() / valid_tokens).item()
++                                opd_variant_metrics["svg/weight_max"] = svg_weights.max().item()
++                                del svg_outputs
++                            if opd_variant in ("outcome", "svg_outcome"):
++                                student_correct = model_inputs.get("outcome_student_correct")
++                                gold_tokens = model_inputs.get("outcome_gold_tokens")
++                                if student_correct is None or gold_tokens is None:
++                                    raise RuntimeError("OC-OPD requires outcome_student_correct/outcome_gold_tokens in the batch")
++                                teacher_wrong = _opd_variants.teacher_first_token_wrong(
++                                    teacher_topk_logps,
++                                    student_topk_indices,
++                                    student_topk_valid_mask,
++                                    gold_tokens,
++                                    response_mask,
++                                )
++                                sequence_weights = _opd_variants.outcome_sequence_weights(
++                                    student_correct.to(response_mask.device),
++                                    teacher_wrong,
++                                    wrong_boost=float(self_distillation_cfg.get("outcome_wrong_boost", 1.0)),
++                                    teacher_wrong_weight=float(self_distillation_cfg.get("outcome_teacher_wrong_weight", 0.25)),
++                                )
++                                opd_token_weights = opd_token_weights * sequence_weights.unsqueeze(1).to(opd_token_weights.device)
++                                mcq = (gold_tokens >= 0).any(-1)
++                                opd_variant_metrics["outcome/student_wrong_frac"] = (student_correct == 0).float().mean().item()
++                                opd_variant_metrics["outcome/teacher_wrong_mcq_frac"] = (
++                                    teacher_wrong.float().sum() / mcq.float().sum().clamp(min=1)
++                                ).item()
+                         loss_compute_start = time.perf_counter()
+                         vopd_loss, vopd_metrics = compute_self_distillation_loss(
+                             student_log_probs=log_prob,
+@@ -2155,7 +2319,9 @@
+                             global_batch_size=distillation_batch_info["global_batch_size"],
+                             loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
+                             dp_size=distillation_batch_info["dp_size"],
++                            token_weights=opd_token_weights,
+                         )
++                        vopd_metrics.update(opd_variant_metrics)
+                         loss_compute_time = time.perf_counter() - loss_compute_start
+                         stage_wall_time_totals["timing_s/update_actor/loss_compute"] += loss_compute_time
+ 
+@@ -2243,6 +2409,54 @@
+                     # scale here would make the gradient depend on dynamic
+                     # micro-batch partitioning.  Other policy losses retain the
+                     # existing accumulation scale.
++                    if selector_compressor is not None and self_distillation_enabled:
++                        selector_config = selector_compressor.importance_config
++                        selector_records = selector_compressor.selector_records
++                        selector_compressor.selector_records = []
++                        selector_aux, selector_metrics = None, _selector_methods.score_std_metric(selector_records)
++                        if selector_mode == "ted" and ted_capture is not None:
++                            selector_aux, ted_metrics = _selector_methods.ted_loss(
++                                selector_records, ted_capture.evidence, coef=selector_config["coef"]
++                            )
++                            selector_metrics.update(ted_metrics)
++                        elif selector_mode == "pgs" and selector_records:
++                            stats = self.__dict__.setdefault("_pgs_baseline_stats", {})
++                            selector_aux, pgs_metrics = _selector_methods.pgs_loss(
++                                selector_records,
++                                _selector_methods.sequence_reverse_kl(log_prob, teacher_log_prob, response_mask),
++                                stats, coef=selector_config["coef"], strength=selector_config["lambda"],
++                                ema=selector_config["pgs_ema"],
++                            )
++                            selector_metrics.update(pgs_metrics)
++                        elif selector_mode == "box":
++                            selector_compressor.selector_box_labels = None
++                            stats = None
++                            if svh_evidence is not None:
++                                stats = self.__dict__.get("_svh_head_stats")
++                                if stats is None:
++                                    stats = _selector_methods.new_head_stats(
++                                        _selector_methods.visual_head_count(teacher_model)
++                                    )
++                                    self._svh_head_stats = stats
++                            selector_aux, box_metrics = _selector_methods.box_selector_loss(
++                                selector_records, svh_evidence, stats,
++                                box_coef=selector_config["box_coef"], svh_coef=selector_config["svh_coef"],
++                            )
++                            selector_metrics.update(box_metrics)
++                        if selector_aux is not None:
++                            policy_loss = policy_loss + selector_aux * micro_batch_scale_factor
++                            selector_metrics["selector/aux_loss"] = float(selector_aux.detach())
++                        if selector_mode == "box":
++                            # Every rank must report the same metric keys (DataProto.concat asserts it); box-label
++                            # metrics exist only when a micro-batch holds a labeled row, so pad them with zeros.
++                            for _key in ("selector/score_std", "selector/box_ce", "selector/box_images",
++                                         "selector/box_recall_at_budget", "selector/aux_loss"):
++                                selector_metrics.setdefault(_key, 0.0)
++                        micro_batch_metrics.update(selector_metrics)
++                    evit_aux, evit_metrics, evit_coef = _efficient_vit.pop_aux_loss(self.actor_module)
++                    if evit_aux is not None and evit_coef:
++                        policy_loss = policy_loss + evit_aux * evit_coef * micro_batch_scale_factor
++                    micro_batch_metrics.update(evit_metrics)
+                     loss = policy_loss if self_distillation_enabled else policy_loss * micro_batch_scale_factor
+                     backward_start = time.perf_counter()
+                     if self.scaler is not None:
+@@ -2315,6 +2529,41 @@
+                 stage_wall_time_totals["timing_s/update_actor/teacher_ema_update"] += (
+                     time.perf_counter() - teacher_update_start
+                 )
++        if self_distillation_enabled:
++            import selector_methods as _selector_methods
++
++            svh_compressor = _selector_methods.find_compressor(self.actor_module)
++            if (
++                svh_compressor is not None
++                and svh_compressor.selector_mode == "box"
++                and svh_compressor.importance_config["svh_coef"] > 0
++            ):
++                # Every rank calls this exactly once per update_policy, so the collective is matched.
++                stats = self.__dict__.get("_svh_head_stats")
++                if stats is None:
++                    stats = _selector_methods.new_head_stats(
++                        _selector_methods.visual_head_count(self.teacher_module or self.actor_module)
++                    )
++                    self._svh_head_stats = stats
++
++                def _sum_ranks(tensor):
++                    if not torch.distributed.is_initialized():
++                        return tensor
++                    device = get_device_id() if torch.cuda.is_available() else "cpu"
++                    work = tensor.to(device)
++                    torch.distributed.all_reduce(work)
++                    return work.cpu()
++
++                previous = None if stats["heads"] is None else stats["heads"].tolist()
++                metrics.update(_selector_methods.refresh_visual_heads(
++                    stats, top=svh_compressor.importance_config["svh_heads"],
++                    min_tokens=svh_compressor.importance_config["svh_min_tokens"], all_reduce=_sum_ranks,
++                ))
++                if stats["heads"] is not None and stats["heads"].tolist() != previous and (
++                    not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
++                ):
++                    print(f"[svh] visual heads (layer*H+head) = {stats['heads'].tolist()} "
++                          f"after {stats['global_tokens']:.0f} aligned tokens", flush=True)
+         metrics["actor/optimizer_steps"] = successful_optimizer_steps
+         metrics["actor/nonzero_lr_optimizer_steps"] = nonzero_lr_optimizer_steps
+         if last_optimizer_lr is not None:
+--- a/learnable_merge/verl/workers/config/actor.py
++++ b/learnable_merge/verl/workers/config/actor.py
+@@ -131,6 +131,16 @@
+     )
+     fallback_to_policy_loss_on_missing_teacher: bool = False
+     log_prob_dump_dir: Optional[str] = None
++    # OPD variants (default "vanilla" leaves the LT-OPD objective unchanged).
++    #   svg:     self-view compression-gap token weighting (student dense view vs. student compressed view)
++    #   outcome: outcome-calibrated sequence weighting from gold answers (student wrong -> boost,
++    #            teacher wrong on MCQ -> damp)
++    #   svg_outcome: both
++    opd_variant: str = "vanilla"
++    svg_eta: float = 0.5
++    svg_max_weight: float = 5.0
++    outcome_wrong_boost: float = 1.0
++    outcome_teacher_wrong_weight: float = 0.25
+ 
+     def __post_init__(self):
+         if not 0.0 <= self.alpha <= 1.0:
+@@ -158,6 +168,12 @@
+             )
+         if self.is_clip is not None and self.is_clip <= 0:
+             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
++        if self.opd_variant not in {"vanilla", "svg", "outcome", "svg_outcome"}:
++            raise ValueError(f"self_distillation.opd_variant must be vanilla/svg/outcome/svg_outcome, got {self.opd_variant!r}")
++        if not 0.0 <= self.svg_eta <= 1.0 or self.svg_max_weight < 1.0:
++            raise ValueError("self_distillation.svg_eta must be in [0,1] and svg_max_weight >= 1")
++        if self.outcome_wrong_boost < 0.0 or not 0.0 <= self.outcome_teacher_wrong_weight <= 1.0:
++            raise ValueError("self_distillation.outcome_wrong_boost must be >= 0 and outcome_teacher_wrong_weight in [0,1]")
+         if self.teacher_prompt_mode is not None and self.teacher_prompt_mode != "answer_hint":
+             raise ValueError(
+                 f"self_distillation.teacher_prompt_mode must be None or 'answer_hint', got {self.teacher_prompt_mode}"
+--- a/learnable_merge/verl/workers/fsdp_workers.py
++++ b/learnable_merge/verl/workers/fsdp_workers.py
+@@ -149,6 +149,9 @@
+         return "summary"
+     if f".{normalized}".endswith(".vision_token_compressor.global_tokens.slots"):
+         return "summary"
++    # LES token-importance scorer  is a new head: head learning rate.
++    if ".vision_token_compressor.importance_scorer." in f".{normalized}":
++        return "summary"
+     if ".vision_token_compressor.global_tokens.encoder." in f".{normalized}":
+         return "vision"
+     if "visual.merger." in f"{normalized}.":

@@ -1,0 +1,36 @@
+# Supplementary: the glance MLLM trained with ETD (frozen scorer, constant exponent 0.25) instead of DivPrune
+# as the student's post-encoder selection. Stage-1 cell choice stays max-min diversity during training.
+data:
+  vqa20k_mixture: lt14k_spatial
+  max_response_length: 256
+actor_rollout_ref:
+  model:
+    vision_token_compressor:
+      curriculum:
+        total_optimizer_steps: 175
+      selector: divprune
+      divprune_seed: centroid
+      efficient_vit: {mode: glance, zoom_ratio: 0.25, min_patches: 4096, feature_distill_coef: 0.0}
+      importance:
+        enabled: true
+        mode: box
+        query_aware: true
+        selector_arch: qsel
+        hidden_size: 256
+        init_checkpoint: path/to/scorer/selector_epoch3.pt  # evidence scorer (scorer/train_selector.py)
+        split_ratio: 0.5
+        box_coef: 0.0
+        text_coef: 0.0
+        svh_coef: 0.0
+        tilt_beta: 0.25
+        tilt_const: true
+  actor:
+    optim:
+      total_training_steps: 175
+      vision_lr: 2.0e-06
+  rollout:
+    n: 1
+    response_length: 256
+trainer:
+  total_training_steps: 175
+  max_actor_ckpt_to_keep: null

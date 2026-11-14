@@ -1,0 +1,14 @@
+Glance-ETD
+Copyright 2026 Yuxuan Wang and the Glance-ETD authors
+
+This repository is licensed under the Apache License, Version 2.0.
+You may obtain a copy of the License in the LICENSE file, or at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+training/ltopd_glance_etd.patch is a modification of the public LT-OPD release
+(https://github.com/Yrxxxxxxxx1007/LT-OPD), which is itself Apache-2.0 and
+includes components from verl, SDPO, CDPruner, and Transformers. Original
+copyright notices in those files still apply. This repository does not
+relicense the upstream LT-OPD code, third-party datasets, images, or model
+weights.
