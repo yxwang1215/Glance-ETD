@@ -9,8 +9,8 @@
 
 <br>
 
-<a href="https://yxwang1215.top/"><b>Yuxuan Wang</b></a><sup>1</sup> · Guangxiang Zhao<sup>2</sup> · Yuxuan Tian<sup>1</sup> · Yahui Han<sup>1</sup> · Xinyu Tan<sup>1</sup><br>
-Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup> · Lin Sun<sup>2</sup> · <a href="https://yangtonghome.github.io/"><b>Tong Yang</b></a><sup>1</sup>
+Yuxuan Wang<sup>1</sup> · Guangxiang Zhao<sup>2</sup> · Yuxuan Tian<sup>1</sup> · Yahui Han<sup>1</sup> · Xinyu Tan<sup>1</sup><br>
+Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup> · Lin Sun<sup>2</sup> · Tong Yang<sup>1</sup>
 
 <sup>1</sup><a href="https://cs.pku.edu.cn/">Peking University</a> &nbsp;&nbsp; <sup>2</sup>Qiyuan Tech
 
