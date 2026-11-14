@@ -16,12 +16,6 @@ Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup>
 
 <br>
 
-<a href="https://yxwang1215.top/papers/glance-etd/"><b>Project Page</b></a> &nbsp;|&nbsp;
-<a href="assets/paper.pdf"><b>Paper</b></a> &nbsp;|&nbsp;
-<a href="https://github.com/yxwang1215/Glance-ETD"><b>Code</b></a>
-
-<br>
-
 <a href="#abstract">Abstract</a> &nbsp;·&nbsp;
 <a href="#method">Method</a> &nbsp;·&nbsp;
 <a href="#results">Results</a> &nbsp;·&nbsp;
