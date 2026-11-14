@@ -5,8 +5,6 @@
 [![Project](https://img.shields.io/badge/Project-Page-0A7CFF?style=flat-square&logo=googlechrome&logoColor=white)](https://yxwang1215.top/papers/glance-etd/)
 [![Paper](https://img.shields.io/badge/Paper-PDF-b31b1b?style=flat-square)](https://github.com/yxwang1215/Glance-ETD/blob/main/assets/paper.pdf)
 [![Code](https://img.shields.io/badge/Code-GitHub-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/yxwang1215/Glance-ETD)
-[![LT-OPD](https://img.shields.io/badge/arXiv-LT--OPD-b31b1b?style=flat-square&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.32353)
-[![Data](https://img.shields.io/badge/Data-LT--OPD--14K-FFD21E?style=flat-square&logo=huggingface&logoColor=black)](https://huggingface.co/datasets/yyy051007/LT-OPD-14K)
 [![CVPR](https://img.shields.io/badge/CVPR-2027_Submission-1f6feb?style=flat-square)](https://yxwang1215.top/papers/glance-etd/)
 
 <br>
@@ -20,11 +18,7 @@ Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup>
 
 <a href="https://yxwang1215.top/papers/glance-etd/"><b>Project Page</b></a> &nbsp;|&nbsp;
 <a href="assets/paper.pdf"><b>Paper</b></a> &nbsp;|&nbsp;
-<a href="https://github.com/yxwang1215/Glance-ETD"><b>Code</b></a> &nbsp;|&nbsp;
-<a href="https://arxiv.org/abs/2609.32353"><b>LT-OPD</b></a> &nbsp;|&nbsp;
-<a href="https://github.com/Yrxxxxxxxx1007/LT-OPD"><b>LT-OPD Code</b></a> &nbsp;|&nbsp;
-<a href="https://lijunxian111.github.io/lt-opd-project/"><b>LT-OPD Page</b></a> &nbsp;|&nbsp;
-<a href="https://huggingface.co/datasets/yyy051007/LT-OPD-14K"><b>Training Data</b></a>
+<a href="https://github.com/yxwang1215/Glance-ETD"><b>Code</b></a>
 
 <br>
 
@@ -52,7 +46,7 @@ Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup>
 
 A high-resolution image becomes thousands of visual tokens, and those tokens dominate prefill. At a strict 5% budget the language model sees about one token in twenty, but two costs remain: the vision encoder still processes every patch, and the few surviving tokens can miss the region that holds the answer. Glance-ETD uses one small question-conditioned scorer for both decisions. A glance encoder reads a low-resolution view and re-encodes only the question-relevant regions at native resolution. [Evidence-Tempered Diversity](#stage-2-etd) then keeps the final tokens by combining [DivPrune](https://arxiv.org/abs/2503.02175)'s max–min distance with the scorer's evidence map.
 
-With 5% of the visual tokens, Glance-ETD retains **91.6%** of the full-token performance of [Qwen3.5-4B](https://qwen.ai/blog?id=qwen3.5) across fourteen benchmarks. That is 17.3 points above [LT-OPD](https://arxiv.org/abs/2609.32353) and 6.0 points above the same training recipe with DivPrune. On 4K images it shortens time to first token by **3.1×**. The same comparison holds on [Gemma 4 E4B](https://arxiv.org/abs/2607.02770), GLM-4.6V-Flash, and InternVL3.5-8B, with the largest gains on text-rich tasks.
+With 5% of the visual tokens, Glance-ETD retains **91.6%** of the full-token performance of [Qwen3.5-4B](https://qwen.ai/blog?id=qwen3.5) across fourteen benchmarks. That is 17.3 points above the strongest prior method and 6.0 points above the same training recipe with DivPrune. On 4K images it shortens time to first token by **3.1×**. The same comparison holds on [Gemma 4 E4B](https://arxiv.org/abs/2607.02770), GLM-4.6V-Flash, and InternVL3.5-8B, with the largest gains on text-rich tasks.
 
 ## Method
 
@@ -76,7 +70,7 @@ i* = argmax_{i not in S}  d_i · (N p_i)^γ,    γ = 0.25
 
 `p` is a softmax over the scorer logits. A flat map returns DivPrune. A peaked map moves the selection toward the answer without dropping the rest of the scene. The strict budget is `K = ⌈0.05 N⌉` on every image. Floor-32, `K = max(32, ⌈0.05 N⌉)`, and the label-free rule `K ∝ N^0.45` are the other budgets in the paper. Kept tokens go to the LLM with their original M-RoPE positions.
 
-**Training.** The MLLM and the glance encoder are trained together by on-policy self-distillation, the objective of [LT-OPD](https://arxiv.org/abs/2609.32353), for 175 steps on [LT-OPD-14K-spatial](#2-data). The student rolls out with DivPrune at 5% and is distilled token by token toward a frozen copy of itself that sees every token. The vision-tower learning rate is 2e-6, ten times the LT-OPD default. The scorer is not updated in this stage. Implementation of the student path is the [patch](training/ltopd_glance_etd.patch) on the [public LT-OPD release](https://github.com/Yrxxxxxxxx1007/LT-OPD).
+**Training.** The MLLM and the glance encoder are trained together by on-policy self-distillation for 175 steps. The student rolls out with DivPrune at 5% and is distilled token by token toward a frozen copy of itself that sees every token. The vision-tower learning rate is 2e-6. The scorer is not updated in this stage. The student path is the [patch](training/ltopd_glance_etd.patch) in this repository.
 
 <img src="assets/motivation.png" width="100%" alt="Motivation at a strict five percent budget. Time to first token on HR-Bench 4K, one TextVQA example, and the share of answer tokens kept by each selector.">
 
@@ -84,11 +78,11 @@ i* = argmax_{i not in S}  d_i · (N p_i)^γ,    γ = 0.25
 
 ## Results
 
-Two averages appear below, and they are not the same number. **91.6%** is the mean retention over the fourteen-benchmark suite (the nine [LT-OPD](https://arxiv.org/abs/2609.32353) benchmarks plus [V\*](https://arxiv.org/abs/2312.14135), HR-Bench 4K/8K, DocVQA, and InfoVQA). **93.3%** is the mean over the nine LT-OPD benchmarks only, which is what the budget plot reports. Retention is each score divided by that model's own non-thinking full-token score.
+Two averages appear below, and they are not the same number. **91.6%** is the mean retention over fourteen benchmarks (the nine in the budget plot, plus [V\*](https://arxiv.org/abs/2312.14135), HR-Bench 4K/8K, DocVQA, and InfoVQA). **93.3%** is the mean over those nine benchmarks only. Retention is each score divided by that model's own non-thinking full-token score.
 
 | Setting | Retention | Comparison |
 |---|---:|---|
-| Glance-ETD, 14 benchmarks, strict 5% | 91.6 ± 0.3% | +17.3 vs. [LT-OPD](https://arxiv.org/abs/2609.32353), +6.0 vs. the same recipe with [DivPrune](https://arxiv.org/abs/2503.02175) |
+| Glance-ETD, 14 benchmarks, strict 5% | 91.6 ± 0.3% | +17.3 vs. the strongest prior method, +6.0 vs. the same recipe with [DivPrune](https://arxiv.org/abs/2503.02175) |
 | Glance-ETD, 9 benchmarks, strict 5% | 93.3% | +17.5 vs. DivPrune; mean of three training seeds |
 | Frozen MLLM + ETD, 14 benchmarks | 82.0% | +10.7 vs. DivPrune, the strongest training-free baseline |
 | Same recipe, DivPrune, 14 benchmarks | 85.6% | ETD on that recipe reaches 90.5% before the glance encoder |
@@ -104,7 +98,7 @@ Solid lines are trained models. Dashed lines are training-free and run on the re
   <img src="assets/budget.png" width="78%" alt="Retention of Qwen3.5-4B from 5 to 50 percent of visual tokens. Glance-ETD is the top curve and stays near the full-token line.">
 </p>
 
-*Nine-benchmark retention on Qwen3.5-4B. At 5%, Glance-ETD keeps 93.3% of the full-token score, 17.5 points above [DivPrune](https://arxiv.org/abs/2503.02175). The other curves are [LT-OPD](https://arxiv.org/abs/2609.32353) without merge, MetaCompress, LLaVA-Mini, DART, EPIC, PruneSID, LearnPruner, and ZOO-Prune.*
+*Nine-benchmark retention on Qwen3.5-4B. At 5%, Glance-ETD keeps 93.3% of the full-token score, 17.5 points above [DivPrune](https://arxiv.org/abs/2503.02175).*
 
 ### Efficiency
 
@@ -149,14 +143,14 @@ On Gemma 4 E4B-it the same gap shows up across budgets. With the MLLM frozen, ET
 | [`glance_etd/glance.py`](glance_etd/glance.py) | Two-pass glance encoder. Training uses diversity cells; inference uses the scorer's top cells. |
 | [`glance_etd/teacher_kl.py`](glance_etd/teacher_kl.py) | Teacher-KL cost of a kept subset, the diagnostic used to choose γ. |
 | [`scorer/`](scorer/) | TextVQA/TextOCR grounding, Visual-CoT merge, and scorer training. |
-| [`training/ltopd_glance_etd.patch`](training/ltopd_glance_etd.patch) | Patch for the public [LT-OPD](https://github.com/Yrxxxxxxxx1007/LT-OPD) release. |
+| [`training/ltopd_glance_etd.patch`](training/ltopd_glance_etd.patch) | Training-code patch: glance encoder on the student path, and the training-side ETD option. |
 | [`training/configs/`](training/configs/) | Final recipe and its seeds, the dense-encoder variant, the learning-rate ablations, and ETD-trained glance. |
-| [`training/build_spatial_train.py`](training/build_spatial_train.py) | Builds LT-OPD-14K-spatial. |
+| [`training/build_spatial_train.py`](training/build_spatial_train.py) | Builds the spatial training mixture used by the recipes. |
 | [`inference/`](inference/) | Full inference pipeline and the label-free scale of `K ∝ N^0.45`. |
 | [`tests/`](tests/) | CPU checks of the reference implementation. |
 | [`assets/`](assets/) | Figures and the [PDF](assets/paper.pdf). |
 
-`glance_etd/` needs only PyTorch. The patch, `scorer/`, and `inference/` reproduce the experiments on top of the public LT-OPD code. The reference functions were checked on CPU against the code used for the paper: DivPrune and ETD selection, the scorer forward pass, and the glance encoder under both cell rules. Model checkpoints are not in this repository.
+`glance_etd/` needs only PyTorch. The patch, `scorer/`, and `inference/` reproduce the experiments. The reference functions were checked on CPU against the code used for the paper: DivPrune and ETD selection, the scorer forward pass, and the glance encoder under both cell rules. Model checkpoints are not in this repository.
 
 ## Quick check
 
@@ -185,9 +179,9 @@ keep = etd_select(tokens, relevance, strict_budget(1200))   # 60 sorted indices
 
 ## Reproducing the experiments
 
-Training used 8×A800 and took about 4.7 hours for 175 steps. Evaluation used 4×A800. The environment is that of the [public LT-OPD release](https://github.com/Yrxxxxxxxx1007/LT-OPD): [Qwen3.5-4B](https://qwen.ai/blog?id=qwen3.5), `transformers` with Qwen3.5 support, `flash-attn`, and [verl](https://github.com/volcengine/verl)/FSDP with Ray.
+Training used 8×A800 and took about 4.7 hours for 175 steps. Evaluation used 4×A800. The stack is [Qwen3.5-4B](https://qwen.ai/blog?id=qwen3.5), `transformers` with Qwen3.5 support, `flash-attn`, and [verl](https://github.com/volcengine/verl)/FSDP with Ray.
 
-**1. Code base.** Apply the patch from the LT-OPD source root, the directory that contains `learnable_merge/`, `lt_opd/`, and `evaluation/`:
+**1. Code base.** Apply [`training/ltopd_glance_etd.patch`](training/ltopd_glance_etd.patch) from the training source root, the directory that contains `learnable_merge/`, `lt_opd/`, and `evaluation/`:
 
 ```bash
 cd LT-OPD/src && patch -p1 < /path/to/Glance-ETD/training/ltopd_glance_etd.patch
@@ -197,7 +191,7 @@ The patch also keeps training-side options used by the supplementary ablations (
 
 <a id="2-data"></a>
 
-**2. Data.** [LT-OPD-14K](https://huggingface.co/datasets/yyy051007/LT-OPD-14K) comes from the LT-OPD release. Spatial multiple-choice rows come from the SAT static split and COCO train2017 instances. Images used by GQA test-dev, POPE, MME, and CV-Bench are excluded. The script writes `DATA/data/LT-OPD-14K-spatial` (12.5K rows from LT-OPD-14K and 1.5K spatial rows).
+**2. Data.** [`training/build_spatial_train.py`](training/build_spatial_train.py) builds the training mixture: 12.5K rows from the base set plus 1.5K spatial multiple-choice rows from the SAT static split and COCO train2017. Images used by GQA test-dev, POPE, MME, and CV-Bench are excluded. The script writes `DATA/data/LT-OPD-14K-spatial`.
 
 ```bash
 LTOPD_DATA_ROOT=DATA LTOPD_SRC=LT-OPD/src python training/build_spatial_train.py
@@ -215,7 +209,7 @@ python -m lt_opd --implementation current export \
     --base-model Qwen3.5-4B --output exports/glance_etd
 ```
 
-[`glance_etd_seed1.yaml`](training/configs/glance_etd_seed1.yaml) and [`glance_etd_seed2.yaml`](training/configs/glance_etd_seed2.yaml) repeat the run. [`dense_lr10x.yaml`](training/configs/dense_lr10x.yaml) is the dense-encoder variant at the same vision learning rate. [`dense_lr1x.yaml`](training/configs/dense_lr1x.yaml) and [`glance_lr1x.yaml`](training/configs/glance_lr1x.yaml) are the component ablations at the LT-OPD vision learning rate. [`glance_trained_with_etd.yaml`](training/configs/glance_trained_with_etd.yaml) trains the glance model with ETD instead of DivPrune.
+[`glance_etd_seed1.yaml`](training/configs/glance_etd_seed1.yaml) and [`glance_etd_seed2.yaml`](training/configs/glance_etd_seed2.yaml) repeat the run. [`dense_lr10x.yaml`](training/configs/dense_lr10x.yaml) is the dense-encoder variant at the same vision learning rate. [`dense_lr1x.yaml`](training/configs/dense_lr1x.yaml) and [`glance_lr1x.yaml`](training/configs/glance_lr1x.yaml) are the component ablations at the base vision learning rate. [`glance_trained_with_etd.yaml`](training/configs/glance_trained_with_etd.yaml) trains the glance model with ETD instead of DivPrune.
 
 **4. Scorer.** One GPU, frozen Qwen3.5-4B. Train it on the untrained model's features and reuse that checkpoint for every Qwen model. `--no-question` trains the question-agnostic scorer reported in the supplementary.
 
@@ -229,7 +223,7 @@ python scorer/train_selector.py scorer_out --root DATA --model Qwen3.5-4B \
     --data DATA/data/selector_train --epochs 3 --samples-per-epoch 60000 --general-weight 0.3
 ```
 
-**5. Inference.** One shard, batch size 1, then the LT-OPD scorer:
+**5. Inference.** One shard, batch size 1, then score the predictions:
 
 ```bash
 export LTOPD_SRC=LT-OPD/src GLANCE_ETD_SCORER=scorer_out/selector_epoch3.pt
@@ -255,11 +249,10 @@ On a dense-encoder model the Stage-1 switch has no effect. Every selector compar
 
 ## Related code and papers
 
-This repository builds on the public [LT-OPD code](https://github.com/Yrxxxxxxxx1007/LT-OPD), its [project page](https://lijunxian111.github.io/lt-opd-project/), and the [LT-OPD-14K](https://huggingface.co/datasets/yyy051007/LT-OPD-14K) mixture. The training stack uses [verl](https://github.com/volcengine/verl).
+Training uses [verl](https://github.com/volcengine/verl). Papers cited in the figures:
 
 | Paper | Link |
 |---|---|
-| LT-OPD | [arXiv:2609.32353](https://arxiv.org/abs/2609.32353) |
 | DivPrune, CVPR 2025 | [arXiv:2503.02175](https://arxiv.org/abs/2503.02175) |
 | FastV, ECCV 2024 | [arXiv:2403.06764](https://arxiv.org/abs/2403.06764) |
 | VisionZip, CVPR 2025 | [arXiv:2412.04467](https://arxiv.org/abs/2412.04467) |
@@ -282,5 +275,5 @@ This repository builds on the public [LT-OPD code](https://github.com/Yrxxxxxxxx
 
 ## License
 
-[Apache-2.0](LICENSE). See [NOTICE](NOTICE). The training patch is a modification of the public LT-OPD release and does not relicense that upstream code, third-party datasets, or model weights.
+[Apache-2.0](LICENSE). See [NOTICE](NOTICE). The training patch does not relicense upstream code, third-party datasets, or model weights.
 
