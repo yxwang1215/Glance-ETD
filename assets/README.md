@@ -4,6 +4,7 @@ Figures from the paper, copied as PNG for the README. They are illustrations of 
 
 | File | Paper figure | What it shows |
 |---|---|---|
+| `paper.pdf` | Camera-ready PDF | The manuscript linked from the README. |
 | `overview.png` | Method overview | Training by on-policy self-distillation, Stage 1 glance selection by the scorer, and Stage 2 ETD with γ = 0.25. |
 | `motivation.png` | Motivation | Encoder time on HR-Bench 4K, one TextVQA example, and answer-token coverage. |
 | `budget.png` | Budget sweep | Retention of Qwen3.5-4B from 5% to 50% of the visual tokens, averaged over nine benchmarks. |
