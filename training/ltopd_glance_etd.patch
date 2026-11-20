@@ -1337,14 +1337,14 @@
          raise ValueError(
              "curriculum CDPruner route budget drift: "
              f"N={route.original_tokens}, K={route.output_tokens}, expected={expected_budget}, "
-@@ -1235,9 +1273,17 @@
+@@ -1235,4 +1273,6 @@
      output_tokens: int,
      seed: str = "nearest_neighbor",
      chunk_tokens: int = 2048,
 +    importance: Optional[torch.Tensor] = None,
 +    forced: Optional[torch.Tensor] = None,
  ) -> torch.Tensor:
-     """DivPrune (Alvar et al., CVPR 2025) greedy max-min diversity on cosine distance.
+@@ -1240,4 +1280,10 @@
  
 +    ``forced`` (BG-OPD): token indices that are selected first (the learned box-relevance top-k); the
 +    remaining budget is filled by max-min diversity from that set.
