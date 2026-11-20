@@ -245,12 +245,12 @@ Training uses [verl](https://github.com/volcengine/verl). Papers cited in the fi
 
 | Paper | Link |
 |---|---|
-| DivPrune, CVPR 2025 | [arXiv:2503.02175](https://arxiv.org/abs/2503.02175) |
+| DivPrune, 2025 | [arXiv:2503.02175](https://arxiv.org/abs/2503.02175) |
 | FastV, ECCV 2024 | [arXiv:2403.06764](https://arxiv.org/abs/2403.06764) |
-| VisionZip, CVPR 2025 | [arXiv:2412.04467](https://arxiv.org/abs/2412.04467) |
+| VisionZip, 2025 | [arXiv:2412.04467](https://arxiv.org/abs/2412.04467) |
 | SparseVLM, ICML 2025 | [arXiv:2410.04417](https://arxiv.org/abs/2410.04417) |
-| PyramidDrop, CVPR 2025 | [arXiv:2410.17247](https://arxiv.org/abs/2410.17247) |
-| V\*, CVPR 2024 | [arXiv:2312.14135](https://arxiv.org/abs/2312.14135) |
+| PyramidDrop, 2025 | [arXiv:2410.17247](https://arxiv.org/abs/2410.17247) |
+| V\*, 2024 | [arXiv:2312.14135](https://arxiv.org/abs/2312.14135) |
 | Qwen3.5 | [blog](https://qwen.ai/blog?id=qwen3.5) |
 | Gemma 4 | [arXiv:2607.02770](https://arxiv.org/abs/2607.02770) |
 
