@@ -3,7 +3,7 @@
 # Glance, then Select:<br>Evidence-Tempered Visual Token Selection<br>for Extremely Compressed Multimodal LLMs
 
 [![Project](https://img.shields.io/badge/Project-Page-0A7CFF?style=flat-square&logo=googlechrome&logoColor=white)](https://yxwang1215.top/papers/glance-etd/)
-[![Paper](https://img.shields.io/badge/Paper-PDF-b31b1b?style=flat-square)](https://github.com/yxwang1215/Glance-ETD/blob/main/assets/paper.pdf)
+[![Paper](https://img.shields.io/badge/Paper-PDF-b31b1b?style=flat-square)](https://arxiv.org/pdf/2611.20006)
 [![Code](https://img.shields.io/badge/Code-GitHub-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/yxwang1215/Glance-ETD)
 [![Status](https://img.shields.io/badge/Status-Under_Review-6B7280?style=flat-square)](https://yxwang1215.top/papers/glance-etd/)
 
@@ -34,7 +34,7 @@ Feiyu Wang<sup>1</sup> · Zongwei Lv<sup>1</sup> · Xiangzheng Zhang<sup>2</sup>
 
 ## News
 
-- **2026-11-14:** Code, [project page](https://yxwang1215.top/papers/glance-etd/), and [PDF](assets/paper.pdf) are released. Checkpoints are not included.
+- **2026-11-14:** Code, [project page](https://yxwang1215.top/papers/glance-etd/), and [PDF](https://arxiv.org/pdf/2611.20006) are released. Checkpoints are not included.
 
 ## Abstract
 
@@ -140,7 +140,7 @@ On Gemma 4 E4B-it the same gap shows up across budgets. With the MLLM frozen, ET
 | [`training/build_spatial_train.py`](training/build_spatial_train.py) | Builds the spatial training mixture used by the recipes. |
 | [`inference/`](inference/) | Full inference pipeline and the label-free scale of `K ∝ N^0.45`. |
 | [`tests/`](tests/) | CPU checks of the reference implementation. |
-| [`assets/`](assets/) | Figures and the [PDF](assets/paper.pdf). |
+| [`assets/`](assets/) | Method and benchmark figures; paper: [arXiv:2611.20006](https://arxiv.org/abs/2611.20006). |
 
 `glance_etd/` needs only PyTorch. The patch, `scorer/`, and `inference/` reproduce the experiments. The reference functions were checked on CPU against the code used for the paper: DivPrune and ETD selection, the scorer forward pass, and the glance encoder under both cell rules. Model checkpoints are not in this repository.
 
