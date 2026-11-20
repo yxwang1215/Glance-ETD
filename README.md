@@ -5,7 +5,7 @@
 [![Project](https://img.shields.io/badge/Project-Page-0A7CFF?style=flat-square&logo=googlechrome&logoColor=white)](https://yxwang1215.top/papers/glance-etd/)
 [![Paper](https://img.shields.io/badge/Paper-PDF-b31b1b?style=flat-square)](https://github.com/yxwang1215/Glance-ETD/blob/main/assets/paper.pdf)
 [![Code](https://img.shields.io/badge/Code-GitHub-181717?style=flat-square&logo=github&logoColor=white)](https://github.com/yxwang1215/Glance-ETD)
-[![CVPR](https://img.shields.io/badge/CVPR-2027_Submission-1f6feb?style=flat-square)](https://yxwang1215.top/papers/glance-etd/)
+[![Status](https://img.shields.io/badge/Status-Under_Review-6B7280?style=flat-square)](https://yxwang1215.top/papers/glance-etd/)
 
 <br>
 
@@ -257,11 +257,13 @@ Training uses [verl](https://github.com/volcengine/verl). Papers cited in the fi
 ## Citation
 
 ```bibtex
-@inproceedings{wang2026glanceetd,
+@misc{wang2026glanceetd,
   title     = {Glance, then Select: Evidence-Tempered Visual Token Selection for Extremely Compressed Multimodal LLMs},
   author    = {Wang, Yuxuan and Zhao, Guangxiang and Tian, Yuxuan and Han, Yahui and Tan, Xinyu and Wang, Feiyu and Lv, Zongwei and Zhang, Xiangzheng and Sun, Lin and Yang, Tong},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year      = {2027}
+  year      = {2026},
+  eprint    = {2611.20006},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.CV}
 }
 ```
 
